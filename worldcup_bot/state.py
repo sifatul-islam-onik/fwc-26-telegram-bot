@@ -12,16 +12,43 @@ def _get_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+_DEFAULTS = {
+    "reminders_enabled": "true",
+    "my_scores_enabled": "true",
+    "all_scores_enabled": "true",
+    "reminder_minutes_before": "60",
+    "timezone": "UTC",
+    "favourite_teams": "[]"
+}
+
 def _init_db():
     """Creates the necessary tables if they do not exist."""
     with _lock:
         with _get_connection() as conn:
             conn.execute('''
-                CREATE TABLE IF NOT EXISTS settings (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    chat_id INTEGER,
+                    key   TEXT,
+                    value TEXT,
+                    PRIMARY KEY (chat_id, key)
                 )
             ''')
+            
+            # Migrate old settings if present
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
+            if cursor.fetchone():
+                cursor = conn.execute("SELECT value FROM settings WHERE key = 'telegram_chat_id'")
+                row = cursor.fetchone()
+                if row:
+                    old_chat_id = int(row["value"])
+                    cursor = conn.execute("SELECT key, value FROM settings WHERE key != 'telegram_chat_id'")
+                    for setting in cursor.fetchall():
+                        conn.execute(
+                            "INSERT OR IGNORE INTO user_settings (chat_id, key, value) VALUES (?, ?, ?)",
+                            (old_chat_id, setting["key"], setting["value"])
+                        )
+                conn.execute("DROP TABLE settings")
+
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS notified_matches (
                     match_id    INTEGER  NOT NULL,
@@ -30,40 +57,34 @@ def _init_db():
                     PRIMARY KEY (match_id, notif_type)
                 )
             ''')
-            
-            # Set defaults if not present
-            defaults = {
-                "reminders_enabled": "true",
-                "my_scores_enabled": "true",
-                "all_scores_enabled": "true",
-                "reminder_minutes_before": "60",
-                "timezone": "UTC",
-                "favourite_teams": "[]"
-            }
-            for k, v in defaults.items():
-                conn.execute(
-                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                    (k, v)
-                )
             conn.commit()
 
-def get_setting(key: str) -> str | None:
-    """Returns the stored value or None if the key has never been set."""
+def get_setting(chat_id: int, key: str) -> str | None:
+    """Returns the stored value or the default if not set."""
     with _lock:
         with _get_connection() as conn:
-            cursor = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            cursor = conn.execute("SELECT value FROM user_settings WHERE chat_id = ? AND key = ?", (chat_id, key))
             row = cursor.fetchone()
-            return row["value"] if row else None
+            if row:
+                return row["value"]
+            return _DEFAULTS.get(key)
 
-def set_setting(key: str, value: str) -> None:
-    """Inserts or replaces the key-value pair."""
+def set_setting(chat_id: int, key: str, value: str) -> None:
+    """Inserts or replaces the key-value pair for a user."""
     with _lock:
         with _get_connection() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                (key, str(value))
+                "INSERT OR REPLACE INTO user_settings (chat_id, key, value) VALUES (?, ?, ?)",
+                (chat_id, key, str(value))
             )
             conn.commit()
+
+def get_all_users() -> list[int]:
+    """Returns a list of all unique chat_ids in the system."""
+    with _lock:
+        with _get_connection() as conn:
+            cursor = conn.execute("SELECT DISTINCT chat_id FROM user_settings")
+            return [row["chat_id"] for row in cursor.fetchall()]
 
 def is_notified(match_id: int, notif_type: str) -> bool:
     """Returns True if a row exists for (match_id, notif_type)."""
@@ -87,9 +108,9 @@ def mark_notified(match_id: int, notif_type: str) -> None:
             )
             conn.commit()
 
-def get_favourite_teams() -> list[dict]:
+def get_favourite_teams(chat_id: int) -> list[dict]:
     """Returns a list of favorite teams, e.g., [{"id": 12, "name": "Brazil", "shortName": "BRA"}]."""
-    val = get_setting("favourite_teams")
+    val = get_setting(chat_id, "favourite_teams")
     if val:
         try:
             return json.loads(val)
@@ -97,40 +118,28 @@ def get_favourite_teams() -> list[dict]:
             pass
     return []
 
-def add_favourite_team(team: dict) -> bool:
+def add_favourite_team(chat_id: int, team: dict) -> bool:
     """Adds a team to favorites if not already present. Returns True if added."""
-    teams = get_favourite_teams()
+    teams = get_favourite_teams(chat_id)
     for t in teams:
         if t["id"] == team["id"]:
             return False
     teams.append({"id": team["id"], "name": team["name"], "shortName": team.get("shortName")})
-    set_setting("favourite_teams", json.dumps(teams))
+    set_setting(chat_id, "favourite_teams", json.dumps(teams))
     return True
 
-def remove_favourite_team(team_id: int) -> bool:
+def remove_favourite_team(chat_id: int, team_id: int) -> bool:
     """Removes a team from favorites by ID. Returns True if removed."""
-    teams = get_favourite_teams()
+    teams = get_favourite_teams(chat_id)
     new_teams = [t for t in teams if t["id"] != team_id]
     if len(new_teams) == len(teams):
         return False
-    set_setting("favourite_teams", json.dumps(new_teams))
+    set_setting(chat_id, "favourite_teams", json.dumps(new_teams))
     return True
 
-def reset_settings() -> None:
-    """Resets all user settings to their default values, keeping internal keys like telegram_chat_id."""
-    defaults = {
-        "reminders_enabled": "true",
-        "my_scores_enabled": "true",
-        "all_scores_enabled": "true",
-        "reminder_minutes_before": "60",
-        "timezone": "UTC",
-        "favourite_teams": "[]"
-    }
+def reset_settings(chat_id: int) -> None:
+    """Resets all user settings by deleting their entries, falling back to defaults."""
     with _lock:
         with _get_connection() as conn:
-            for k, v in defaults.items():
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                    (k, v)
-                )
+            conn.execute("DELETE FROM user_settings WHERE chat_id = ?", (chat_id,))
             conn.commit()

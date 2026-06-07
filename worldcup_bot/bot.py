@@ -35,9 +35,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    state.set_setting("telegram_chat_id", str(chat_id))
-    
-    fav_teams = state.get_favourite_teams()
+    fav_teams = state.get_favourite_teams(chat_id)
     fav_names = ", ".join([t["name"] for t in fav_teams])
     
     welcome_msg = (
@@ -46,27 +44,29 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Your favourite teams: " + (f"*{_escape(fav_names)}*" if fav_names else "none set\\. Please use /addteam to choose one\\.") + "\n\n"
         "Use /help to see all available commands\\."
     )
-    await send_text(context.application, welcome_msg)
+    await send_text(context.application, chat_id, welcome_msg)
 
 async def addteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     query = " ".join(context.args)
     if not query:
-        await send_text(context.application, "Usage: /addteam <team name\\>\nExample: /addteam Brazil")
+        await send_text(context.application, chat_id, "Usage: /addteam <team name\\>\nExample: /addteam Brazil")
         return
         
     try:
         team = football_api.search_team(query)
         if not team:
             msg = f"❌ No team found matching '{_escape(query)}' in the World Cup roster\\. Try a different spelling, e\\.g\\. /addteam Brazil"
-            await send_text(context.application, msg)
+            await send_text(context.application, chat_id, msg)
             return
             
-        added = state.add_favourite_team(team)
+        added = state.add_favourite_team(chat_id, team)
         if not added:
-            await send_text(context.application, f"ℹ️ *{_escape(team['name'])}* is already in your favourites\\.")
+            await send_text(context.application, chat_id, f"ℹ️ *{_escape(team['name'])}* is already in your favourites\\.")
             return
             
-        await send_text(context.application, f"✅ Added *{_escape(team['name'])}* to your favourite teams\\. Syncing schedule…")
+        await send_text(context.application, chat_id, f"✅ Added *{_escape(team['name'])}* to your favourite teams\\. Syncing schedule…")
         
         # Run sync_schedule in executor
         loop = asyncio.get_running_loop()
@@ -76,21 +76,23 @@ async def addteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         matches = football_api.get_team_matches(team["id"])
         upcoming = [m for m in matches if m.get("status") in ("SCHEDULED", "TIMED")]
         
-        await send_text(context.application, f"📅 Schedule updated\\. Found {_escape(str(len(upcoming)))} upcoming matches for {_escape(team['name'])}\\.")
+        await send_text(context.application, chat_id, f"📅 Schedule updated\\. Found {_escape(str(len(upcoming)))} upcoming matches for {_escape(team['name'])}\\.")
         
     except ValueError:
-        await send_text(context.application, "❌ Multiple teams matched\\. Please be more specific\\.")
+        await send_text(context.application, chat_id, "❌ Multiple teams matched\\. Please be more specific\\.")
     except Exception as e:
         logger.error(f"Error in addteam: {e}")
-        await send_text(context.application, "❌ An error occurred while adding the team\\.")
+        await send_text(context.application, chat_id, "❌ An error occurred while adding the team\\.")
 
 async def removeteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     query = " ".join(context.args).lower()
     if not query:
-        await send_text(context.application, "Usage: /removeteam <team name\\>\nExample: /removeteam Brazil")
+        await send_text(context.application, chat_id, "Usage: /removeteam <team name\\>\nExample: /removeteam Brazil")
         return
         
-    fav_teams = state.get_favourite_teams()
+    fav_teams = state.get_favourite_teams(chat_id)
     matched_team = None
     
     # Try exact match first
@@ -107,53 +109,63 @@ async def removeteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
                 
     if not matched_team:
-        await send_text(context.application, f"❌ '{_escape(query)}' is not in your favourite teams\\.")
+        await send_text(context.application, chat_id, f"❌ '{_escape(query)}' is not in your favourite teams\\.")
         return
         
-    state.remove_favourite_team(matched_team["id"])
-    await send_text(context.application, f"🗑 Removed *{_escape(matched_team['name'])}* from your favourite teams\\.")
+    state.remove_favourite_team(chat_id, matched_team["id"])
+    await send_text(context.application, chat_id, f"🗑 Removed *{_escape(matched_team['name'])}* from your favourite teams\\.")
     
     # Sync schedule to remove reminders
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, scheduler.sync_schedule, context.application)
 
 async def teams_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fav_teams = state.get_favourite_teams()
+    chat_id = update.effective_chat.id
+
+    fav_teams = state.get_favourite_teams(chat_id)
     if fav_teams:
         names = "\n• ".join([_escape(t["name"]) for t in fav_teams])
-        await send_text(context.application, f"👕 *Favourite teams:*\n• {names}")
+        await send_text(context.application, chat_id, f"👕 *Favourite teams:*\n• {names}")
     else:
-        await send_text(context.application, "No favourite teams set\\. Use /addteam to choose one\\.")
+        await send_text(context.application, chat_id, "No favourite teams set\\. Use /addteam to choose one\\.")
 
-async def _toggle_setting(application, args, setting_key, label_on, label_off, current_label):
+async def _toggle_setting(application, chat_id, args, setting_key, label_on, label_off, current_label):
     if not args:
-        current = state.get_setting(setting_key)
+        current = state.get_setting(chat_id, setting_key)
         status = "On" if current != "false" else "Off"
-        await send_text(application, f"{current_label}: *{status}*")
+        await send_text(application, chat_id, f"{current_label}: *{status}*")
         return
         
     arg = args[0].lower()
     if arg == "on":
-        state.set_setting(setting_key, "true")
-        await send_text(application, f"{current_label}: *On*")
+        state.set_setting(chat_id, setting_key, "true")
+        await send_text(application, chat_id, f"{current_label}: *On*")
     elif arg == "off":
-        state.set_setting(setting_key, "false")
-        await send_text(application, f"{current_label}: *Off*")
+        state.set_setting(chat_id, setting_key, "false")
+        await send_text(application, chat_id, f"{current_label}: *Off*")
     else:
-        await send_text(application, f"Usage: /{label_on} \\[on\\|off\\]")
+        await send_text(application, chat_id, f"Usage: /{label_on} \\[on\\|off\\]")
 
 async def reminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_setting(context.application, context.args, "reminders_enabled", "reminders", "reminders", "🔔 Pre\\-match reminders")
+    chat_id = update.effective_chat.id
+
+    await _toggle_setting(context.application, chat_id, context.args, "reminders_enabled", "reminders", "reminders", "🔔 Pre\\-match reminders")
 
 async def myscores_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_setting(context.application, context.args, "my_scores_enabled", "myscores", "myscores", "⭐ My team result notifications")
+    chat_id = update.effective_chat.id
+
+    await _toggle_setting(context.application, chat_id, context.args, "my_scores_enabled", "myscores", "myscores", "⭐ My team result notifications")
 
 async def allscores_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_setting(context.application, context.args, "all_scores_enabled", "allscores", "allscores", "🌍 All match result notifications")
+    chat_id = update.effective_chat.id
+
+    await _toggle_setting(context.application, chat_id, context.args, "all_scores_enabled", "allscores", "allscores", "🌍 All match result notifications")
 
 async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     if not context.args:
-        await send_text(context.application, "Usage: /setreminder <minutes\\>\nExample: /setreminder 60")
+        await send_text(context.application, chat_id, "Usage: /setreminder <minutes\\>\nExample: /setreminder 60")
         return
         
     try:
@@ -161,39 +173,43 @@ async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (1 <= minutes <= 1440):
             raise ValueError()
             
-        state.set_setting("reminder_minutes_before", str(minutes))
+        state.set_setting(chat_id, "reminder_minutes_before", str(minutes))
         
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, scheduler.sync_schedule, context.application)
         
-        await send_text(context.application, f"⏰ Reminder set to *{_escape(str(minutes))} minutes* before kickoff\\.")
+        await send_text(context.application, chat_id, f"⏰ Reminder set to *{_escape(str(minutes))} minutes* before kickoff\\.")
     except ValueError:
-        await send_text(context.application, "❌ Please provide a valid integer between 1 and 1440\\.")
+        await send_text(context.application, chat_id, "❌ Please provide a valid integer between 1 and 1440\\.")
 
 async def settimezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     if not context.args:
-        await send_text(context.application, "Usage: /settimezone <tz\\>\nExample: /settimezone Asia/Dhaka")
+        await send_text(context.application, chat_id, "Usage: /settimezone <tz\\>\nExample: /settimezone Asia/Dhaka")
         return
         
     tz_str = " ".join(context.args)
     try:
         pytz.timezone(tz_str)
-        state.set_setting("timezone", tz_str)
-        await send_text(context.application, f"🌍 Timezone set to *{_escape(tz_str)}*\\.")
+        state.set_setting(chat_id, "timezone", tz_str)
+        await send_text(context.application, chat_id, f"🌍 Timezone set to *{_escape(tz_str)}*\\.")
     except pytz.exceptions.UnknownTimeZoneError:
-        await send_text(context.application, "❌ Unknown timezone\\. Use IANA format, e\\.g\\. Asia/Dhaka")
+        await send_text(context.application, chat_id, "❌ Unknown timezone\\. Use IANA format, e\\.g\\. Asia/Dhaka")
 
-def _get_user_tz():
-    tz_str = state.get_setting("timezone") or "UTC"
+def _get_user_tz(chat_id):
+    tz_str = state.get_setting(chat_id, "timezone") or "UTC"
     try:
         return pytz.timezone(tz_str), tz_str
     except pytz.exceptions.UnknownTimeZoneError:
         return pytz.UTC, "UTC"
 
 async def nextmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fav_teams = state.get_favourite_teams()
+    chat_id = update.effective_chat.id
+
+    fav_teams = state.get_favourite_teams(chat_id)
     if not fav_teams:
-        await send_text(context.application, "No favourite teams set\\. Use /addteam to choose one\\.")
+        await send_text(context.application, chat_id, "No favourite teams set\\. Use /addteam to choose one\\.")
         return
         
     all_upcoming = []
@@ -203,7 +219,7 @@ async def nextmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_upcoming.extend(upcoming)
         
     if not all_upcoming:
-        await send_text(context.application, "No upcoming matches found for your favourite teams\\.")
+        await send_text(context.application, chat_id, "No upcoming matches found for your favourite teams\\.")
         return
         
     # Deduplicate by match ID
@@ -211,7 +227,7 @@ async def nextmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sorted_upcoming = sorted(unique_upcoming, key=lambda x: x.get("utcDate", ""))
     
     match = sorted_upcoming[0]
-    user_tz, tz_str = _get_user_tz()
+    user_tz, tz_str = _get_user_tz(chat_id)
     match_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00")).astimezone(user_tz)
     
     stage = _format_stage(match.get("stage", ""))
@@ -231,12 +247,14 @@ async def nextmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕐 *{time_esc}* \\({tz_esc}\\)\n"
         f"📅 *{date_esc}*"
     )
-    await send_text(context.application, msg)
+    await send_text(context.application, chat_id, msg)
 
 async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fav_teams = state.get_favourite_teams()
+    chat_id = update.effective_chat.id
+
+    fav_teams = state.get_favourite_teams(chat_id)
     if not fav_teams:
-        await send_text(context.application, "No favourite teams set\\. Use /addteam to choose one\\.")
+        await send_text(context.application, chat_id, "No favourite teams set\\. Use /addteam to choose one\\.")
         return
         
     all_upcoming = []
@@ -246,14 +264,14 @@ async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_upcoming.extend(upcoming)
         
     if not all_upcoming:
-        await send_text(context.application, "No upcoming matches found for your favourite teams\\.")
+        await send_text(context.application, chat_id, "No upcoming matches found for your favourite teams\\.")
         return
         
     # Deduplicate by match ID
     unique_upcoming = {m["id"]: m for m in all_upcoming}.values()
     sorted_upcoming = sorted(unique_upcoming, key=lambda x: x.get("utcDate", ""))
     
-    user_tz, tz_str = _get_user_tz()
+    user_tz, tz_str = _get_user_tz(chat_id)
     tz_esc = _escape(tz_str)
     
     fav_names = ", ".join([t["name"] for t in fav_teams])
@@ -273,9 +291,11 @@ async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"   📅 {date_esc} · ⏰ {time_esc} \\({tz_esc}\\)\n"
         msg += f"   🏆 {stage_group}\n\n"
         
-    await send_text(context.application, msg)
+    await send_text(context.application, chat_id, msg)
 
 async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     if context.args:
         arg = context.args[0].lower()
         if arg == "today":
@@ -286,7 +306,7 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 target_date = datetime.strptime(arg, "%Y-%m-%d").date()
             except ValueError:
-                await send_text(context.application, "Usage: /results \\[today \\| yesterday \\| yyyy\\-MM\\-dd\\]")
+                await send_text(context.application, chat_id, "Usage: /results \\[today \\| yesterday \\| yyyy\\-MM\\-dd\\]")
                 return
     else:
         target_date = datetime.now(pytz.utc).date()
@@ -305,11 +325,11 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 finished_matches.append(m)
                 
     if not day_had_matches:
-        await send_text(context.application, f"No World Cup matches on {_escape(target_date_str)}\\.")
+        await send_text(context.application, chat_id, f"No World Cup matches on {_escape(target_date_str)}\\.")
         return
         
     if not finished_matches:
-        await send_text(context.application, f"No finished matches on {_escape(target_date_str)}\\.")
+        await send_text(context.application, chat_id, f"No finished matches on {_escape(target_date_str)}\\.")
         return
         
     finished_matches.sort(key=lambda x: x.get("utcDate", ""))
@@ -326,14 +346,16 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         lines.append(f"✅ *{home_esc}* {h_score} – {a_score} *{away_esc}* _{stage_group}_")
         
-    await send_text(context.application, "\n".join(lines))
+    await send_text(context.application, chat_id, "\n".join(lines))
 
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     all_matches = football_api.get_all_wc_matches()
     live_matches = [m for m in all_matches if m.get("status") in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")]
     
     if not live_matches:
-        await send_text(context.application, "No matches currently in progress\\.")
+        await send_text(context.application, chat_id, "No matches currently in progress\\.")
         return
         
     lines = []
@@ -348,9 +370,11 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         lines.append(f"🔴 LIVE — *{home_esc}* {h_score} – {a_score} *{away_esc}* · _{stage_group}_")
         
-    await send_text(context.application, "\n\n".join(lines))
+    await send_text(context.application, chat_id, "\n\n".join(lines))
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     all_matches = football_api.get_all_wc_matches()
     target_date = datetime.now(pytz.utc).date()
     target_date_str = target_date.strftime("%Y-%m-%d")
@@ -358,7 +382,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_matches = [m for m in all_matches if m.get("utcDate", "").startswith(target_date_str)]
     
     if not today_matches:
-        await send_text(context.application, "No World Cup matches today\\.")
+        await send_text(context.application, chat_id, "No World Cup matches today\\.")
         return
         
     today_matches.sort(key=lambda x: x.get("utcDate", ""))
@@ -367,7 +391,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live = []
     finished = []
     
-    user_tz, tz_str = _get_user_tz()
+    user_tz, tz_str = _get_user_tz(chat_id)
     
     for m in today_matches:
         status = m.get("status")
@@ -399,17 +423,19 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if finished:
         parts.append("✅ FINISHED\n" + "\n".join(finished))
         
-    await send_text(context.application, "\n\n".join(parts))
+    await send_text(context.application, chat_id, "\n\n".join(parts))
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fav_teams = state.get_favourite_teams()
+    chat_id = update.effective_chat.id
+
+    fav_teams = state.get_favourite_teams(chat_id)
     fav_names = ", ".join([t["name"] for t in fav_teams]) or "None"
     
-    reminder_mins = state.get_setting("reminder_minutes_before") or "60"
-    reminders_on = "On" if state.get_setting("reminders_enabled") != "false" else "Off"
-    myscores_on = "On" if state.get_setting("my_scores_enabled") != "false" else "Off"
-    allscores_on = "On" if state.get_setting("all_scores_enabled") != "false" else "Off"
-    tz_str = state.get_setting("timezone") or "UTC"
+    reminder_mins = state.get_setting(chat_id, "reminder_minutes_before") or "60"
+    reminders_on = "On" if state.get_setting(chat_id, "reminders_enabled") != "false" else "Off"
+    myscores_on = "On" if state.get_setting(chat_id, "my_scores_enabled") != "false" else "Off"
+    allscores_on = "On" if state.get_setting(chat_id, "all_scores_enabled") != "false" else "Off"
+    tz_str = state.get_setting(chat_id, "timezone") or "UTC"
     
     msg = (
         "⚙️ *Settings*\n\n"
@@ -420,10 +446,12 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌍 All match results: *{allscores_on}*\n"
         f"🕐 Timezone: *{_escape(tz_str)}*"
     )
-    await send_text(context.application, msg)
+    await send_text(context.application, chat_id, msg)
 
 async def syncnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_text(context.application, "🔄 Syncing…")
+    chat_id = update.effective_chat.id
+
+    await send_text(context.application, chat_id, "🔄 Syncing…")
     
     # Run sync in background so we don't block
     loop = asyncio.get_running_loop()
@@ -434,9 +462,11 @@ async def syncnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = sum(1 for j in jobs if j.id.startswith("remind_"))
     pollers = sum(1 for j in jobs if j.id.startswith("poll_"))
     
-    await send_text(context.application, f"✅ Done\\. Reminders: {_escape(str(reminders))}\\. Result pollers: {_escape(str(pollers))}\\.")
+    await send_text(context.application, chat_id, f"✅ Done\\. Reminders: {_escape(str(reminders))}\\. Result pollers: {_escape(str(pollers))}\\.")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     now = datetime.now()
     uptime = now - BOT_START_TIME
     hours, remainder = divmod(int(uptime.total_seconds()), 3600)
@@ -456,7 +486,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if valid_jobs:
             first = valid_jobs[0]
             next_job = first.id
-            user_tz, tz_str = _get_user_tz()
+            user_tz, tz_str = _get_user_tz(chat_id)
             next_time = first.next_run_time.astimezone(user_tz).strftime('%I:%M:%S %p')
             
     msg = (
@@ -468,10 +498,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if next_job and next_time:
         msg += f"🔜 Next job: *{_escape(next_job)}* at *{_escape(next_time)}*"
         
-    await send_text(context.application, msg)
+    await send_text(context.application, chat_id, msg)
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state.reset_settings()
+    chat_id = update.effective_chat.id
+
+    state.reset_settings(chat_id)
     
     loop = asyncio.get_running_loop()
     try:
@@ -479,9 +511,18 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except football_api.RateLimitException:
         pass
         
-    await send_text(context.application, "✅ All settings have been reset to their defaults\\.")
+    await send_text(context.application, chat_id, "✅ All settings have been reset to their defaults\\.")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    users = state.get_all_users()
+    total_users = len(users)
+    msg = f"📊 *Bot Statistics*\n\nTotal unique users tracking teams: *{total_users}*"
+    await send_text(context.application, chat_id, msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     msg = (
         "📖 *Command Reference*\n\n"
         "*Configuration*\n"
@@ -505,9 +546,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*System*\n"
         "• /syncnow — Manually force a schedule sync\n"
         "• /status — View bot diagnostics\n"
+        "• /stats — Track bot usage and total users\n"
         "• /help — Show this message"
     )
-    await send_text(context.application, msg)
+    await send_text(context.application, chat_id, msg)
 
 def main():
     state._init_db()
@@ -534,6 +576,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("syncnow", syncnow_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     
     sched = scheduler.start_scheduler(application)

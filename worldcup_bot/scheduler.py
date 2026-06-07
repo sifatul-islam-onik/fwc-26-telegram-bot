@@ -56,12 +56,16 @@ def sync_schedule(application):
     pollers_count = 0
     futures_count = 0
     
+    users = state.get_all_users()
+    now_utc = datetime.now(pytz.utc)
+    
     # PART A — Pre-match reminders (favourite teams only)
-    fav_teams = state.get_favourite_teams()
-    if not fav_teams:
-        logger.warning("No favourite teams found in state. Skipping reminders sync.")
-    else:
-        minutes_before = int(state.get_setting("reminder_minutes_before") or 60)
+    for chat_id in users:
+        fav_teams = state.get_favourite_teams(chat_id)
+        if not fav_teams:
+            continue
+            
+        minutes_before = int(state.get_setting(chat_id, "reminder_minutes_before") or 60)
         
         all_fav_matches = {}
         for team in fav_teams:
@@ -73,31 +77,27 @@ def sync_schedule(application):
                     
         for match_id, match in all_fav_matches.items():
             status = match.get("status")
-            job_id = f"remind_{match_id}"
+            job_id = f"remind_{chat_id}_{match_id}"
             
             if status == "POSTPONED":
-                if _scheduler.get_job(job_id) and not state.is_notified(match_id, "reminder"):
+                if _scheduler.get_job(job_id):
                     _scheduler.remove_job(job_id)
                 continue
                 
             if status in ("SCHEDULED", "TIMED"):
-                if state.is_notified(match_id, "reminder"):
-                    continue
-                    
                 match_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
                 reminder_dt = match_dt - timedelta(minutes=minutes_before)
-                now_utc = datetime.now(pytz.utc)
                 
                 if reminder_dt <= now_utc:
                     continue
                     
-                def make_reminder_func(app, m):
+                def make_reminder_func(app, c_id, m):
                     def wrapper():
-                        _run_async(notifier.send_reminder(app, m))
+                        _run_async(notifier.send_reminder(app, c_id, m))
                     return wrapper
                 
                 _scheduler.add_job(
-                    func=make_reminder_func(application, match),
+                    func=make_reminder_func(application, chat_id, match),
                     trigger=DateTrigger(run_date=reminder_dt),
                     id=job_id,
                     replace_existing=True

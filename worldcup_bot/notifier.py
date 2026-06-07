@@ -35,13 +35,8 @@ def _format_group(group: str | None) -> str:
         return ""
     return group.replace("_", " ").title()
 
-async def send_text(application, text: str) -> bool:
-    """Sends a plain MarkdownV2 message to the stored chat_id."""
-    chat_id = state.get_setting("telegram_chat_id")
-    if not chat_id:
-        logger.warning("No chat_id found. User has not run /start.")
-        return False
-        
+async def send_text(application, chat_id: int, text: str) -> bool:
+    """Sends a plain MarkdownV2 message to the specified chat_id."""
     try:
         await application.bot.send_message(
             chat_id=chat_id,
@@ -50,24 +45,19 @@ async def send_text(application, text: str) -> bool:
         )
         return True
     except TelegramError as e:
-        logger.error(f"Failed to send text message: {e}")
+        logger.error(f"Failed to send text message to {chat_id}: {e}")
         return False
 
-async def send_reminder(application, match: dict):
-    chat_id = state.get_setting("telegram_chat_id")
-    if not chat_id:
-        logger.warning("No chat_id found. Cannot send reminder.")
-        return
-
-    if state.get_setting("reminders_enabled") == "false":
+async def send_reminder(application, chat_id: int, match: dict):
+    if state.get_setting(chat_id, "reminders_enabled") == "false":
         return
         
     match_id = match.get("id")
-    if not match_id or state.is_notified(match_id, "reminder"):
+    if not match_id:
         return
 
     # Process times
-    tz_str = state.get_setting("timezone") or "UTC"
+    tz_str = state.get_setting(chat_id, "timezone") or "UTC"
     try:
         user_tz = pytz.timezone(tz_str)
     except pytz.exceptions.UnknownTimeZoneError:
@@ -76,7 +66,7 @@ async def send_reminder(application, match: dict):
     match_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
     local_dt = match_dt.astimezone(user_tz)
     
-    minutes_before = int(state.get_setting("reminder_minutes_before") or 60)
+    minutes_before = int(state.get_setting(chat_id, "reminder_minutes_before") or 60)
     
     home_id = match.get("homeTeam.id")
     away_id = match.get("awayTeam.id")
@@ -85,7 +75,7 @@ async def send_reminder(application, match: dict):
     stage = _format_stage(match.get("stage", ""))
     group = _format_group(match.get("group"))
     
-    fav_teams = state.get_favourite_teams()
+    fav_teams = state.get_favourite_teams(chat_id)
     fav_names = []
     for t in fav_teams:
         if t["id"] == home_id or t["id"] == away_id:
@@ -121,95 +111,92 @@ async def send_reminder(application, match: dict):
             text=msg,
             parse_mode=ParseMode.MARKDOWN_V2
         )
-        state.mark_notified(match_id, "reminder")
         
         # Arm result poller directly
         from scheduler import _arm_result_poller
         _arm_result_poller(application, match_id, home, away)
     except TelegramError as e:
-        logger.error(f"Failed to send reminder for match {match_id}: {e}")
+        logger.error(f"Failed to send reminder for match {match_id} to {chat_id}: {e}")
 
 async def send_result(application, match: dict):
-    chat_id = state.get_setting("telegram_chat_id")
-    if not chat_id:
-        logger.warning("No chat_id found. Cannot send result.")
+    match_id = match.get("id")
+    if not match_id or state.is_notified(match_id, "result"):
         return
         
-    fav_teams = state.get_favourite_teams()
-    fav_ids = [t["id"] for t in fav_teams]
-    
     home_id = match.get("homeTeam.id")
     away_id = match.get("awayTeam.id")
     home = match.get("homeTeam.name", "TBD")
     away = match.get("awayTeam.name", "TBD")
     
-    match_involves_fav = (home_id in fav_ids or away_id in fav_ids)
-    
-    if match_involves_fav and state.get_setting("my_scores_enabled") == "false":
-        return
-    if not match_involves_fav and state.get_setting("all_scores_enabled") == "false":
-        return
-        
-    match_id = match.get("id")
-    if not match_id or state.is_notified(match_id, "result"):
-        return
-        
     stage = _format_stage(match.get("stage", ""))
     group = _format_group(match.get("group"))
     stage_group = _escape(f"{stage} · {group}" if group else stage)
-    
     home_esc = _escape(home)
     away_esc = _escape(away)
-    
     status = match.get("status")
-    if status == "CANCELLED":
-        msg = (
-            "🏁 *FULL TIME*\n\n"
-            f"🏆 FIFA World Cup · {stage_group}\n"
-            f"🆚 *{home_esc}* vs *{away_esc}*\n"
-            "Match cancelled ❌"
-        )
-    else:
-        h_score = match.get("score.fullTime.home")
-        a_score = match.get("score.fullTime.away")
-        h_score = h_score if h_score is not None else 0
-        a_score = a_score if a_score is not None else 0
-        h_score_esc = _escape(str(h_score))
-        a_score_esc = _escape(str(a_score))
+
+    users = state.get_all_users()
+    for chat_id in users:
+        fav_teams = state.get_favourite_teams(chat_id)
+        fav_ids = [t["id"] for t in fav_teams]
         
-        msg = (
-            "🏁 *FULL TIME*\n\n"
-            f"🏆 FIFA World Cup · {stage_group}\n"
-            f"🆚 *{home_esc}* {h_score_esc} – {a_score_esc} *{away_esc}*"
-        )
+        match_involves_fav = (home_id in fav_ids or away_id in fav_ids)
         
-        if match_involves_fav:
-            winner = match.get("score.winner")
-            outcomes = []
-            for t in fav_teams:
-                t_id = t["id"]
-                if t_id not in (home_id, away_id):
-                    continue
-                    
-                t_name = _escape(t["name"])
-                if winner == "HOME_TEAM" and home_id == t_id:
-                    outcomes.append(f"⭐ *{t_name}: WIN 🎉*")
-                elif winner == "AWAY_TEAM" and away_id == t_id:
-                    outcomes.append(f"⭐ *{t_name}: WIN 🎉*")
-                elif winner == "DRAW":
-                    outcomes.append(f"⭐ *{t_name}: DRAW 🤝*")
-                else:
-                    outcomes.append(f"⭐ *{t_name}: LOSS 😔*")
-                    
-            if outcomes:
-                msg += "\n\n" + "\n".join(outcomes)
+        if match_involves_fav and state.get_setting(chat_id, "my_scores_enabled") == "false":
+            continue
+        if not match_involves_fav and state.get_setting(chat_id, "all_scores_enabled") == "false":
+            continue
             
-    try:
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        state.mark_notified(match_id, "result")
-    except TelegramError as e:
-        logger.error(f"Failed to send result for match {match_id}: {e}")
+        if status == "CANCELLED":
+            msg = (
+                "🏁 *FULL TIME*\n\n"
+                f"🏆 FIFA World Cup · {stage_group}\n"
+                f"🆚 *{home_esc}* vs *{away_esc}*\n"
+                "Match cancelled ❌"
+            )
+        else:
+            h_score = match.get("score.fullTime.home")
+            a_score = match.get("score.fullTime.away")
+            h_score = h_score if h_score is not None else 0
+            a_score = a_score if a_score is not None else 0
+            h_score_esc = _escape(str(h_score))
+            a_score_esc = _escape(str(a_score))
+            
+            msg = (
+                "🏁 *FULL TIME*\n\n"
+                f"🏆 FIFA World Cup · {stage_group}\n"
+                f"🆚 *{home_esc}* {h_score_esc} – {a_score_esc} *{away_esc}*"
+            )
+            
+            if match_involves_fav:
+                winner = match.get("score.winner")
+                outcomes = []
+                for t in fav_teams:
+                    t_id = t["id"]
+                    if t_id not in (home_id, away_id):
+                        continue
+                        
+                    t_name = _escape(t["name"])
+                    if winner == "HOME_TEAM" and home_id == t_id:
+                        outcomes.append(f"⭐ *{t_name}: WIN 🎉*")
+                    elif winner == "AWAY_TEAM" and away_id == t_id:
+                        outcomes.append(f"⭐ *{t_name}: WIN 🎉*")
+                    elif winner == "DRAW":
+                        outcomes.append(f"⭐ *{t_name}: DRAW 🤝*")
+                    else:
+                        outcomes.append(f"⭐ *{t_name}: LOSS 😔*")
+                        
+                if outcomes:
+                    msg += "\n\n" + "\n".join(outcomes)
+                
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send result for match {match_id} to {chat_id}: {e}")
+            
+    # Mark global notification as complete
+    state.mark_notified(match_id, "result")
