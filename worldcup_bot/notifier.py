@@ -7,6 +7,7 @@ from telegram.helpers import escape_markdown
 from telegram.error import TelegramError
 
 import state
+from state import _DEFAULTS as _STATE_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,10 @@ def _format_stage(stage: str) -> str:
         return ""
     mapping = {
         "GROUP_STAGE": "Group Stage",
+        "ROUND_OF_32": "Round of 32",
+        "LAST_32": "Round of 32",
         "ROUND_OF_16": "Round of 16",
+        "LAST_16": "Round of 16",
         "QUARTER_FINALS": "Quarter Finals",
         "SEMI_FINALS": "Semi Finals",
         "THIRD_PLACE": "Third Place",
@@ -35,38 +39,41 @@ def _format_group(group: str | None) -> str:
         return ""
     return group.replace("_", " ").title()
 
-async def send_text(application, chat_id: int, text: str) -> bool:
-    """Sends a plain MarkdownV2 message to the specified chat_id."""
+async def send_text(application, chat_id: int, text: str, reply_markup=None) -> bool:
+    """Sends a plain MarkdownV2 message to the specified chat_id with optional reply_markup."""
     try:
         await application.bot.send_message(
             chat_id=chat_id,
             text=text,
-            parse_mode=ParseMode.MARKDOWN_V2
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=reply_markup
         )
         return True
     except TelegramError as e:
         logger.error(f"Failed to send text message to {chat_id}: {e}")
         return False
 
-async def send_reminder(application, chat_id: int, match: dict):
+async def send_reminder(application, chat_id: int, match: dict, offset: int = None):
     if state.get_setting(chat_id, "reminders_enabled") == "false":
         return
         
     match_id = match.get("id")
-    if not match_id:
-        return
-
-    # Process times
     tz_str = state.get_setting(chat_id, "timezone") or "UTC"
     try:
         user_tz = pytz.timezone(tz_str)
     except pytz.exceptions.UnknownTimeZoneError:
         user_tz = pytz.UTC
-
+ 
     match_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
     local_dt = match_dt.astimezone(user_tz)
     
-    minutes_before = int(state.get_setting(chat_id, "reminder_minutes_before") or 60)
+    if offset is None:
+        try:
+            offsets = state.get_reminder_offsets(chat_id)
+            offset = offsets[0] if offsets else 60
+        except Exception:
+            offset = 60
+    minutes_before = offset
     
     home_id = match.get("homeTeam.id")
     away_id = match.get("awayTeam.id")
@@ -111,10 +118,13 @@ async def send_reminder(application, chat_id: int, match: dict):
             text=msg,
             parse_mode=ParseMode.MARKDOWN_V2
         )
-        
-        # Arm result poller directly
-        from scheduler import _arm_result_poller
-        _arm_result_poller(application, match_id, home, away)
+
+        # Arm result poller directly (late import avoids circular dependency)
+        try:
+            from scheduler import _arm_result_poller  # noqa: PLC0415
+            _arm_result_poller(application, match_id, home, away)
+        except ImportError:
+            pass
     except TelegramError as e:
         logger.error(f"Failed to send reminder for match {match_id} to {chat_id}: {e}")
 
@@ -135,16 +145,28 @@ async def send_result(application, match: dict):
     away_esc = _escape(away)
     status = match.get("status")
 
-    users = state.get_all_users()
+    # One DB query for all users' settings instead of N×3 individual queries
+    all_settings = state.get_all_user_settings()
+    users = list(all_settings.keys())
+
     for chat_id in users:
-        fav_teams = state.get_favourite_teams(chat_id)
+        user_cfg = all_settings.get(chat_id, {})
+        fav_teams_raw = user_cfg.get("favourite_teams", _STATE_DEFAULTS["favourite_teams"])
+        try:
+            import json as _json
+            fav_teams = _json.loads(fav_teams_raw)
+        except Exception:
+            fav_teams = []
         fav_ids = [t["id"] for t in fav_teams]
-        
+
         match_involves_fav = (home_id in fav_ids or away_id in fav_ids)
-        
-        if match_involves_fav and state.get_setting(chat_id, "my_scores_enabled") == "false":
+
+        my_scores = user_cfg.get("my_scores_enabled", _STATE_DEFAULTS["my_scores_enabled"])
+        all_scores = user_cfg.get("all_scores_enabled", _STATE_DEFAULTS["all_scores_enabled"])
+
+        if match_involves_fav and my_scores == "false":
             continue
-        if not match_involves_fav and state.get_setting(chat_id, "all_scores_enabled") == "false":
+        if not match_involves_fav and all_scores == "false":
             continue
             
         if status == "CANCELLED":
@@ -244,20 +266,34 @@ async def send_goal_alert(application, match: dict, prev_home: int, prev_away: i
         f"{scorer_line}"
     )
 
-    users = state.get_all_users()
+    # One DB query for all users' settings instead of N×4 individual queries
+    all_settings = state.get_all_user_settings()
+    users = list(all_settings.keys())
+
     for chat_id in users:
+        user_cfg = all_settings.get(chat_id, {})
+
         # Respect the live goal alert toggle first
-        if state.get_setting(chat_id, "live_goals_enabled") == "false":
+        live_goals = user_cfg.get("live_goals_enabled", _STATE_DEFAULTS["live_goals_enabled"])
+        if live_goals == "false":
             continue
 
-        fav_teams = state.get_favourite_teams(chat_id)
+        fav_teams_raw = user_cfg.get("favourite_teams", _STATE_DEFAULTS["favourite_teams"])
+        try:
+            import json as _json
+            fav_teams = _json.loads(fav_teams_raw)
+        except Exception:
+            fav_teams = []
         fav_ids = [t["id"] for t in fav_teams]
         match_involves_fav = (home_id in fav_ids or away_id in fav_ids)
 
+        my_scores = user_cfg.get("my_scores_enabled", _STATE_DEFAULTS["my_scores_enabled"])
+        all_scores = user_cfg.get("all_scores_enabled", _STATE_DEFAULTS["all_scores_enabled"])
+
         # Respect notification toggles
-        if match_involves_fav and state.get_setting(chat_id, "my_scores_enabled") == "false":
+        if match_involves_fav and my_scores == "false":
             continue
-        if not match_involves_fav and state.get_setting(chat_id, "all_scores_enabled") == "false":
+        if not match_involves_fav and all_scores == "false":
             continue
 
         try:

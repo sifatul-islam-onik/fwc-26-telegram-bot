@@ -1,6 +1,7 @@
 """Client for football-data.org API v4."""
 import time
 import logging
+from datetime import datetime, timezone
 import requests
 from requests.exceptions import RequestException
 
@@ -73,27 +74,45 @@ def _normalise(raw: dict) -> dict:
         "score.winner": score_dict.get("winner")
     }
 
-def search_team(query: str) -> dict | None:
-    """Searches for a team by name or shortName in the WC competition."""
+_teams_cache = None
+
+def get_all_teams() -> list[dict]:
+    """Returns all teams in the competition, cached in memory."""
+    global _teams_cache
+    if _teams_cache is not None:
+        return _teams_cache
+        
     url = f"{BASE_URL}/competitions/{COMPETITION_CODE}/teams"
     data = _safe_get(url)
     if not data or "teams" not in data:
+        return []
+        
+    _teams_cache = [
+        {
+            "id": team.get("id"),
+            "name": team.get("name"),
+            "shortName": team.get("shortName"),
+            "crest": team.get("crest")
+        }
+        for team in data["teams"]
+    ]
+    return _teams_cache
+
+def search_team(query: str) -> dict | None:
+    """Searches for a team by name or shortName in the WC competition."""
+    teams = get_all_teams()
+    if not teams:
         return None
         
     query_lower = query.lower()
     matches = []
     
-    for team in data["teams"]:
+    for team in teams:
         name = (team.get("name") or "").lower()
         short_name = (team.get("shortName") or "").lower()
         
         if query_lower in name or query_lower in short_name:
-            matches.append({
-                "id": team.get("id"),
-                "name": team.get("name"),
-                "shortName": team.get("shortName"),
-                "crest": team.get("crest")
-            })
+            matches.append(team)
             
     if len(matches) > 1:
         raise ValueError("Multiple teams matched")
@@ -102,33 +121,52 @@ def search_team(query: str) -> dict | None:
         
     return None
 
+_matches_cache = None
+_matches_cache_time = 0.0
+
+def get_all_wc_matches(bypass_cache: bool = False) -> list[dict]:
+    """Returns ALL matches in the tournament, cached in memory for 5 minutes."""
+    global _matches_cache, _matches_cache_time
+    
+    now = time.time()
+    if not bypass_cache and _matches_cache is not None and (now - _matches_cache_time) < 300:
+        logger.debug("Returning cached WC matches list.")
+        return _matches_cache
+        
+    url = f"{BASE_URL}/competitions/{COMPETITION_CODE}/matches"
+    try:
+        data = _safe_get(url)
+    except RateLimitException:
+        if _matches_cache is not None:
+            logger.warning("API rate limited. Returning cached WC matches list.")
+            return _matches_cache
+        raise
+        
+    if not data or "matches" not in data:
+        if _matches_cache is not None:
+            logger.warning("API matches fetch failed. Returning cached WC matches list.")
+            return _matches_cache
+        return []
+        
+    _matches_cache = [_normalise(m) for m in data["matches"]]
+    _matches_cache_time = now
+    return _matches_cache
+
 def get_team_matches(team_id: int) -> list[dict]:
     """Fetches all matches for a specific team in the WC competition."""
-    url = f"{BASE_URL}/competitions/{COMPETITION_CODE}/matches"
-    data = _safe_get(url)
-    if not data or "matches" not in data:
-        return []
-        
-    matches = []
-    for match in data["matches"]:
-        home_team = match.get("homeTeam") or {}
-        away_team = match.get("awayTeam") or {}
-        home_id = home_team.get("id")
-        away_id = away_team.get("id")
-        
-        if home_id == team_id or away_id == team_id:
-            matches.append(_normalise(match))
-            
-    return matches
+    all_matches = get_all_wc_matches()
+    return filter_team_matches(all_matches, team_id)
 
-def get_all_wc_matches() -> list[dict]:
-    """Returns ALL matches in the tournament."""
-    url = f"{BASE_URL}/competitions/{COMPETITION_CODE}/matches"
-    data = _safe_get(url)
-    if not data or "matches" not in data:
-        return []
-        
-    return [_normalise(m) for m in data["matches"]]
+def filter_team_matches(all_matches: list[dict], team_id: int) -> list[dict]:
+    """Filters an already-fetched match list for a specific team.
+
+    Use this instead of get_team_matches() when you already have the full list
+    to avoid an extra API call.
+    """
+    return [
+        m for m in all_matches
+        if m.get("homeTeam.id") == team_id or m.get("awayTeam.id") == team_id
+    ]
 
 def get_live_matches() -> list[dict]:
     """Returns only matches that are currently live or probably live.
@@ -138,14 +176,11 @@ def get_live_matches() -> list[dict]:
     even after kickoff — any match whose kickoff was 0-130 minutes ago and
     hasn't been marked FINISHED/AWARDED/CANCELLED/POSTPONED.
     """
-    import time as _time
-    from datetime import datetime as _dt, timezone as _tz
-
     LIVE_STATUSES = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
     FINISHED_STATUSES = ("FINISHED", "AWARDED", "CANCELLED", "POSTPONED")
 
-    all_matches = get_all_wc_matches()   # single network call
-    now_utc = _dt.now(_tz.utc)
+    all_matches = get_all_wc_matches(bypass_cache=True)   # single network call
+    now_utc = datetime.now(timezone.utc)
     live = []
 
     for m in all_matches:
@@ -155,7 +190,7 @@ def get_live_matches() -> list[dict]:
         elif status not in FINISHED_STATUSES:
             utc_date_str = m.get("utcDate")
             if utc_date_str:
-                match_dt = _dt.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
                 elapsed = (now_utc - match_dt).total_seconds()
                 if 0 <= elapsed <= 130 * 60:
                     live.append(m)

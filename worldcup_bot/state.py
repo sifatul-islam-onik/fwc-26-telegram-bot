@@ -2,6 +2,7 @@
 import sqlite3
 import threading
 import json
+import datetime
 
 DB_PATH = "worldcup_bot.db"
 _lock = threading.Lock()
@@ -58,6 +59,11 @@ def _init_db():
                     PRIMARY KEY (match_id, notif_type)
                 )
             ''')
+            # Index for fast per-user setting lookups
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_settings_chat_id
+                ON user_settings (chat_id)
+            ''')
             conn.commit()
 
 def get_setting(chat_id: int, key: str) -> str | None:
@@ -99,7 +105,6 @@ def is_notified(match_id: int, notif_type: str) -> bool:
 
 def mark_notified(match_id: int, notif_type: str) -> None:
     """Inserts the row. Ignores if already present."""
-    import datetime
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with _lock:
         with _get_connection() as conn:
@@ -138,9 +143,53 @@ def remove_favourite_team(chat_id: int, team_id: int) -> bool:
     set_setting(chat_id, "favourite_teams", json.dumps(new_teams))
     return True
 
+def get_reminder_offsets(chat_id: int) -> list[int]:
+    """Returns a list of reminder offsets (in minutes) for a user."""
+    val = get_setting(chat_id, "reminder_minutes_before")
+    if not val:
+        return [60]
+    try:
+        parsed = json.loads(val)
+        if isinstance(parsed, list):
+            return [int(x) for x in parsed]
+        return [int(parsed)]
+    except Exception:
+        try:
+            return [int(val)]
+        except ValueError:
+            return [60]
+
+def set_reminder_offsets(chat_id: int, offsets: list[int]) -> None:
+    """Saves the list of reminder offsets for a user."""
+    set_setting(chat_id, "reminder_minutes_before", json.dumps(offsets))
+
+
 def reset_settings(chat_id: int) -> None:
     """Resets all user settings by deleting their entries, falling back to defaults."""
     with _lock:
         with _get_connection() as conn:
             conn.execute("DELETE FROM user_settings WHERE chat_id = ?", (chat_id,))
             conn.commit()
+
+def get_all_user_settings() -> dict[int, dict[str, str]]:
+    """Returns all settings for all users in a single DB query.
+
+    Returns {chat_id: {key: value, ...}, ...} — missing keys fall back to
+    _DEFAULTS at the call site.  Use this in broadcast functions instead of
+    calling get_setting() N times per user.
+    """
+    with _lock:
+        with _get_connection() as conn:
+            cursor = conn.execute("SELECT chat_id, key, value FROM user_settings")
+            result: dict[int, dict[str, str]] = {}
+            for row in cursor.fetchall():
+                cid = row["chat_id"]
+                if cid not in result:
+                    result[cid] = {}
+                result[cid][row["key"]] = row["value"]
+            return result
+
+def get_user_setting_from_bulk(bulk: dict, chat_id: int, key: str) -> str | None:
+    """Looks up a setting from a pre-fetched bulk dict, falling back to _DEFAULTS."""
+    user_data = bulk.get(chat_id, {})
+    return user_data.get(key, _DEFAULTS.get(key))

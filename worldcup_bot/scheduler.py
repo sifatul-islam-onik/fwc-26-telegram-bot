@@ -10,6 +10,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import state
 import football_api
 import notifier
+from notifier import _format_stage as _pretty_stage, _format_group as _pretty_group  # re-export aliases
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +33,8 @@ def _run_async(coro):
     else:
         asyncio.run(coro)
 
-def _pretty_stage(stage: str) -> str:
-    """Converts API enum strings to readable labels."""
-    if not stage:
-        return ""
-    mapping = {
-        "GROUP_STAGE": "Group Stage",
-        "ROUND_OF_16": "Round of 16",
-        "QUARTER_FINALS": "Quarter Finals",
-        "SEMI_FINALS": "Semi Finals",
-        "THIRD_PLACE": "Third Place",
-        "FINAL": "Final"
-    }
-    return mapping.get(stage, stage.replace("_", " ").title())
+# _pretty_stage and _pretty_group are imported from notifier above.
+# They are kept as aliases here so any existing call-sites continue to work.
 
 def _pretty_group(group: str | None) -> str:
     """'GROUP_A' -> 'Group A'. Returns '' if group is None."""
@@ -61,55 +51,59 @@ def sync_schedule(application):
     futures_count = 0
     
     users = state.get_all_users()
-    now_utc = datetime.now(pytz.utc)
+    now_utc = datetime.now(pytz.utc)  # computed once for the entire sync
     
+    # Clear all existing reminder jobs first to prevent stale jobs (e.g. from removed teams or changed offsets)
+    for job in list(_scheduler.get_jobs()):
+        if job.id.startswith("remind_"):
+            _scheduler.remove_job(job.id)
+
     # PART A — Pre-match reminders (favourite teams only)
+    # Fetch all matches once; filter per-team locally to save API calls.
+    all_wc_matches = football_api.get_all_wc_matches()
+
     for chat_id in users:
         fav_teams = state.get_favourite_teams(chat_id)
         if not fav_teams:
             continue
-            
-        minutes_before = int(state.get_setting(chat_id, "reminder_minutes_before") or 60)
-        
+
+        offsets = state.get_reminder_offsets(chat_id)
+
         all_fav_matches = {}
         for team in fav_teams:
-            matches = football_api.get_team_matches(team["id"])
-            for match in matches:
+            for match in football_api.filter_team_matches(all_wc_matches, team["id"]):
                 match_id = match.get("id")
                 if match_id:
                     all_fav_matches[match_id] = match
                     
         for match_id, match in all_fav_matches.items():
             status = match.get("status")
-            job_id = f"remind_{chat_id}_{match_id}"
             
-            if status == "POSTPONED":
-                if _scheduler.get_job(job_id):
-                    _scheduler.remove_job(job_id)
-                continue
-                
             if status in ("SCHEDULED", "TIMED"):
                 match_dt = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
-                reminder_dt = match_dt - timedelta(minutes=minutes_before)
                 
-                if reminder_dt <= now_utc:
-                    continue
+                for offset in offsets:
+                    job_id = f"remind_{chat_id}_{match_id}_{offset}"
+                    reminder_dt = match_dt - timedelta(minutes=offset)
                     
-                def make_reminder_func(app, c_id, m):
-                    def wrapper():
-                        _run_async(notifier.send_reminder(app, c_id, m))
-                    return wrapper
-                
-                _scheduler.add_job(
-                    func=make_reminder_func(application, chat_id, match),
-                    trigger=DateTrigger(run_date=reminder_dt),
-                    id=job_id,
-                    replace_existing=True
-                )
-                reminders_count += 1
+                    if reminder_dt <= now_utc:
+                        continue
+                        
+                    def make_reminder_func(app, c_id, m):
+                        def wrapper():
+                            _run_async(notifier.send_reminder(app, c_id, m))
+                        return wrapper
+                    
+                    _scheduler.add_job(
+                        func=make_reminder_func(application, chat_id, match),
+                        trigger=DateTrigger(run_date=reminder_dt),
+                        id=job_id,
+                        replace_existing=True
+                    )
+                    reminders_count += 1
 
-    # PART B — Result pollers (ALL WC matches)
-    all_matches = football_api.get_all_wc_matches()
+    # PART B — Result pollers (ALL WC matches) — reuse the list already fetched above
+    all_matches = all_wc_matches
     for match in all_matches:
         match_id = match.get("id")
         if not match_id or state.is_notified(match_id, "result"):
@@ -117,9 +111,10 @@ def sync_schedule(application):
             
         status = match.get("status")
         utc_date_str = match.get("utcDate")
-        if not utc_date_str: continue
+        if not utc_date_str:
+            continue
         match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
-        now_utc = datetime.now(pytz.utc)
+        # now_utc is already computed at the top of sync_schedule
         
         home_name = match.get("homeTeam.name", "TBD")
         away_name = match.get("awayTeam.name", "TBD")
