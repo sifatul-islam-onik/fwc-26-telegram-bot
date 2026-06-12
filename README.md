@@ -2,7 +2,16 @@
 
 A fully-featured Telegram bot that keeps you up-to-date with every match of the **FIFA World Cup 2026** — from pre-match reminders and live goal alerts, to full-time results and the complete tournament fixture.
 
+## 🟢 Live Demo
+
+> **The bot is live and ready to use — no setup required!**
+>
+> 👉 **[t.me/SIFFWC26BOT](https://t.me/SIFFWC26BOT)**
+>
+> Open Telegram, start a chat with **@SIFFWC26BOT**, send `/start`, and you're in.
+
 ---
+
 
 ## ✨ Features
 
