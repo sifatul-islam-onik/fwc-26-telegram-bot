@@ -4,14 +4,17 @@ import asyncio
 from datetime import datetime, timedelta
 import pytz
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
 
 import config
 import state
 import football_api
+from football_api import RateLimitException
 import scheduler
 from notifier import send_text, _escape, _format_stage, _format_group
+
+RATE_LIMIT_MSG = "⏳ The football data service is temporarily rate\\-limited\\. Please try again in a minute or two\\."
 
 # Set up logging
 logging.basicConfig(
@@ -78,6 +81,8 @@ async def addteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await send_text(context.application, chat_id, f"📅 Schedule updated\\. Found {_escape(str(len(upcoming)))} upcoming matches for {_escape(team['name'])}\\.")
         
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
     except ValueError:
         await send_text(context.application, chat_id, "❌ Multiple teams matched\\. Please be more specific\\.")
     except Exception as e:
@@ -161,6 +166,11 @@ async def allscores_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _toggle_setting(context.application, chat_id, context.args, "all_scores_enabled", "allscores", "allscores", "🌍 All match result notifications")
 
+async def livegoals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    await _toggle_setting(context.application, chat_id, context.args, "live_goals_enabled", "livegoals", "livegoals", "⚽ Live goal notifications")
+
 async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -212,11 +222,20 @@ async def nextmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_text(context.application, chat_id, "No favourite teams set\\. Use /addteam to choose one\\.")
         return
         
-    all_upcoming = []
-    for t in fav_teams:
-        matches = football_api.get_team_matches(t["id"])
-        upcoming = [m for m in matches if m.get("status") in ("SCHEDULED", "TIMED")]
-        all_upcoming.extend(upcoming)
+    try:
+        now_utc = datetime.now(pytz.utc)
+        all_upcoming = []
+        for t in fav_teams:
+            matches = football_api.get_team_matches(t["id"])
+            for m in matches:
+                if m.get("status") not in ("SCHEDULED", "TIMED"):
+                    continue
+                match_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+                if match_dt > now_utc:
+                    all_upcoming.append(m)
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
         
     if not all_upcoming:
         await send_text(context.application, chat_id, "No upcoming matches found for your favourite teams\\.")
@@ -257,11 +276,20 @@ async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_text(context.application, chat_id, "No favourite teams set\\. Use /addteam to choose one\\.")
         return
         
-    all_upcoming = []
-    for t in fav_teams:
-        matches = football_api.get_team_matches(t["id"])
-        upcoming = [m for m in matches if m.get("status") in ("SCHEDULED", "TIMED")]
-        all_upcoming.extend(upcoming)
+    try:
+        now_utc = datetime.now(pytz.utc)
+        all_upcoming = []
+        for t in fav_teams:
+            matches = football_api.get_team_matches(t["id"])
+            for m in matches:
+                if m.get("status") not in ("SCHEDULED", "TIMED"):
+                    continue
+                match_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+                if match_dt > now_utc:
+                    all_upcoming.append(m)
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
         
     if not all_upcoming:
         await send_text(context.application, chat_id, "No upcoming matches found for your favourite teams\\.")
@@ -296,12 +324,15 @@ async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
+    user_tz, tz_str = _get_user_tz(chat_id)
+    now_local = datetime.now(user_tz)
+
     if context.args:
         arg = context.args[0].lower()
         if arg == "today":
-            target_date = datetime.now(pytz.utc).date()
+            target_date = now_local.date()
         elif arg == "yesterday":
-            target_date = (datetime.now(pytz.utc) - timedelta(days=1)).date()
+            target_date = (now_local - timedelta(days=1)).date()
         else:
             try:
                 target_date = datetime.strptime(arg, "%Y-%m-%d").date()
@@ -309,9 +340,14 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_text(context.application, chat_id, "Usage: /results \\[today \\| yesterday \\| yyyy\\-MM\\-dd\\]")
                 return
     else:
-        target_date = datetime.now(pytz.utc).date()
+        target_date = now_local.date()
         
-    all_matches = football_api.get_all_wc_matches()
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
+
     target_date_str = target_date.strftime("%Y-%m-%d")
     
     finished_matches = []
@@ -319,7 +355,10 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for m in all_matches:
         utc_date_str = m.get("utcDate", "")
-        if utc_date_str.startswith(target_date_str):
+        if not utc_date_str:
+            continue
+        match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
+        if match_dt.date() == target_date:
             day_had_matches = True
             if m.get("status") in ("FINISHED", "AWARDED"):
                 finished_matches.append(m)
@@ -351,15 +390,44 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    all_matches = football_api.get_all_wc_matches()
-    live_matches = [m for m in all_matches if m.get("status") in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")]
-    
-    if not live_matches:
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
+
+    now_utc = datetime.now(pytz.utc)
+
+    # Matches the API explicitly marks as live
+    api_live_statuses = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
+    # Statuses that mean the match is definitely over
+    finished_statuses = ("FINISHED", "AWARDED", "CANCELLED", "POSTPONED")
+
+    confirmed_live = []
+    probable_live = []
+
+    for m in all_matches:
+        status = m.get("status")
+
+        if status in api_live_statuses:
+            confirmed_live.append(m)
+        elif status not in finished_statuses:
+            # The free API tier often keeps status as TIMED/SCHEDULED even
+            # after kickoff.  Treat any match whose kickoff was 0-130 mins
+            # ago (and hasn't been marked finished) as probably live.
+            utc_date_str = m.get("utcDate")
+            if utc_date_str:
+                match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                elapsed = (now_utc - match_dt).total_seconds()
+                if 0 <= elapsed <= 130 * 60:
+                    probable_live.append(m)
+
+    if not confirmed_live and not probable_live:
         await send_text(context.application, chat_id, "No matches currently in progress\\.")
         return
-        
+
     lines = []
-    for m in live_matches:
+    for m in confirmed_live:
         home_esc = _escape(m.get("homeTeam.name", "TBD"))
         away_esc = _escape(m.get("awayTeam.name", "TBD"))
         h_score = _escape(str(m.get("score.fullTime.home") or 0))
@@ -367,19 +435,194 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage = _format_stage(m.get("stage", ""))
         group = _format_group(m.get("group"))
         stage_group = _escape(f"{stage} · {group}" if group else stage)
-        
         lines.append(f"🔴 LIVE — *{home_esc}* {h_score} – {a_score} *{away_esc}* · _{stage_group}_")
-        
+
+    for m in probable_live:
+        home_esc = _escape(m.get("homeTeam.name", "TBD"))
+        away_esc = _escape(m.get("awayTeam.name", "TBD"))
+        h_score = m.get("score.fullTime.home")
+        a_score = m.get("score.fullTime.away")
+        stage = _format_stage(m.get("stage", ""))
+        group = _format_group(m.get("group"))
+        stage_group = _escape(f"{stage} · {group}" if group else stage)
+
+        match_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+        elapsed_mins = int((now_utc - match_dt).total_seconds() // 60)
+        elapsed_esc = _escape(f"~{elapsed_mins}'")
+
+        if h_score is not None and a_score is not None:
+            score_str = f"{_escape(str(h_score))} – {_escape(str(a_score))}"
+        else:
+            score_str = "vs"
+
+        lines.append(f"🟡 IN PROGRESS \\({elapsed_esc}\\) — *{home_esc}* {score_str} *{away_esc}* · _{stage_group}_")
+
     await send_text(context.application, chat_id, "\n\n".join(lines))
+
+async def fixture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the full tournament fixture grouped by stage and group."""
+    chat_id = update.effective_chat.id
+    user_tz, tz_str = _get_user_tz(chat_id)
+    now_utc = datetime.now(pytz.utc)
+
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
+
+    if not all_matches:
+        await send_text(context.application, chat_id, "No fixture data available yet\\.")
+        return
+
+    # Sort matches chronologically
+    all_matches.sort(key=lambda m: m.get("utcDate", ""))
+
+    # Stage display order
+    STAGE_ORDER = [
+        "GROUP_STAGE", "ROUND_OF_16", "QUARTER_FINALS",
+        "SEMI_FINALS", "THIRD_PLACE", "FINAL"
+    ]
+    LIVE_STATUSES = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
+    FINISHED_STATUSES = ("FINISHED", "AWARDED", "CANCELLED")
+
+    # Group matches: {stage -> {group_label -> [matches]}}
+    from collections import defaultdict
+    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    stages_seen = []
+
+    for m in all_matches:
+        stage = m.get("stage") or "UNKNOWN"
+        group = m.get("group")  # None for knockout stages
+        group_label = _format_group(group) if group else ""
+
+        if stage not in stages_seen:
+            stages_seen.append(stage)
+        grouped[stage][group_label].append(m)
+
+    # Build message chunks (split at ~4000 chars to stay under Telegram 4096 limit)
+    MAX_CHUNK = 4000
+    chunks: list[str] = []
+    current = "\U0001f4cb *FIFA World Cup 2026 — Full Fixture*\n"
+    current += f"_Times shown in {_escape(tz_str)}_\n"
+
+    # Iterate stages in defined order, then any extras
+    ordered_stages = [s for s in STAGE_ORDER if s in grouped]
+    ordered_stages += [s for s in stages_seen if s not in ordered_stages]
+
+    for stage in ordered_stages:
+        stage_label = _escape(_format_stage(stage))
+        groups_in_stage = grouped[stage]
+
+        # Sort groups alphabetically (empty string = knockout, comes first in that context)
+        sorted_groups = sorted(groups_in_stage.keys())
+
+        for group_label in sorted_groups:
+            matches_in_group = groups_in_stage[group_label]
+
+            # Section header
+            if group_label:
+                header = f"\n\n\u2501\u2501 *{stage_label} \u00b7 {_escape(group_label)}* \u2501\u2501"
+            else:
+                header = f"\n\n\u2501\u2501 *{stage_label}* \u2501\u2501"
+
+            if len(current) + len(header) > MAX_CHUNK:
+                chunks.append(current)
+                current = header + "\n"
+            else:
+                current += header + "\n"
+
+            for m in matches_in_group:
+                status = m.get("status", "")
+                home = m.get("homeTeam.name") or "TBD"
+                away = m.get("awayTeam.name") or "TBD"
+                home_esc = _escape(home)
+                away_esc = _escape(away)
+
+                utc_date_str = m.get("utcDate", "")
+                if utc_date_str:
+                    match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
+                    date_str = _escape(match_dt.strftime("%a %d %b"))
+                    time_str = _escape(match_dt.strftime("%H:%M"))
+                else:
+                    date_str = _escape("TBD")
+                    time_str = ""
+
+                h_score = m.get("score.fullTime.home")
+                a_score = m.get("score.fullTime.away")
+
+                if status in FINISHED_STATUSES:
+                    icon = "\u2705"  # ✅
+                    if h_score is not None and a_score is not None:
+                        score_part = f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
+                    else:
+                        score_part = f"*{home_esc}* vs *{away_esc}*"
+                elif status in LIVE_STATUSES:
+                    icon = "\U0001f534"  # 🔴
+                    if h_score is not None and a_score is not None:
+                        score_part = f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
+                    else:
+                        score_part = f"*{home_esc}* vs *{away_esc}*"
+                elif utc_date_str and status in ("TIMED", "SCHEDULED"):
+                    m_dt_utc = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                    elapsed = (now_utc - m_dt_utc).total_seconds()
+                    if 0 < elapsed <= 130 * 60:  # Probably live (free-tier lag)
+                        icon = "\U0001f7e1"  # 🟡
+                        elapsed_mins = int(elapsed // 60)
+                        if h_score is not None and a_score is not None:
+                            score_part = (
+                                f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
+                                f" _\\(\u007e{_escape(str(elapsed_mins))}'\\)_"
+                            )
+                        else:
+                            score_part = f"*{home_esc}* vs *{away_esc}*"
+                    else:
+                        icon = "\U0001f551"  # 🕑
+                        score_part = f"*{home_esc}* vs *{away_esc}*"
+                else:
+                    icon = "\U0001f551"  # 🕑
+                    score_part = f"*{home_esc}* vs *{away_esc}*"
+
+                if time_str:
+                    line = f"{icon} `{date_str}` {time_str} \u2014 {score_part}\n"
+                else:
+                    line = f"{icon} {score_part}\n"
+
+                if len(current) + len(line) > MAX_CHUNK:
+                    chunks.append(current)
+                    current = line
+                else:
+                    current += line
+
+    if current.strip():
+        chunks.append(current)
+
+    for chunk in chunks:
+        await send_text(context.application, chat_id, chunk)
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    all_matches = football_api.get_all_wc_matches()
-    target_date = datetime.now(pytz.utc).date()
+    user_tz, tz_str = _get_user_tz(chat_id)
+
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
+
+    now_utc = datetime.now(pytz.utc)
+    target_date = datetime.now(user_tz).date()
     target_date_str = target_date.strftime("%Y-%m-%d")
     
-    today_matches = [m for m in all_matches if m.get("utcDate", "").startswith(target_date_str)]
+    today_matches = []
+    for m in all_matches:
+        utc_date_str = m.get("utcDate", "")
+        if not utc_date_str:
+            continue
+        match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
+        if match_dt.date() == target_date:
+            today_matches.append(m)
     
     if not today_matches:
         await send_text(context.application, chat_id, "No World Cup matches today\\.")
@@ -391,8 +634,6 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live = []
     finished = []
     
-    user_tz, tz_str = _get_user_tz(chat_id)
-    
     for m in today_matches:
         status = m.get("status")
         home_esc = _escape(m.get("homeTeam.name", "TBD"))
@@ -400,13 +641,9 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage = _format_stage(m.get("stage", ""))
         group = _format_group(m.get("group"))
         stage_group = _escape(f"{stage} · {group}" if group else stage)
+        match_dt_utc = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
         
-        if status in ("SCHEDULED", "TIMED"):
-            match_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(user_tz)
-            time_esc = _escape(match_dt.strftime('%I:%M %p'))
-            tz_esc = _escape(tz_str)
-            upcoming.append(f"• {home_esc} vs {away_esc} — {time_esc} \\({tz_esc}\\) · {stage_group}")
-        elif status in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT"):
+        if status in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT"):
             h_score = _escape(str(m.get("score.fullTime.home") or 0))
             a_score = _escape(str(m.get("score.fullTime.away") or 0))
             live.append(f"• {home_esc} {h_score} – {a_score} {away_esc} · {stage_group}")
@@ -414,15 +651,90 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             h_score = _escape(str(m.get("score.fullTime.home") or 0))
             a_score = _escape(str(m.get("score.fullTime.away") or 0))
             finished.append(f"• {home_esc} {h_score} – {a_score} {away_esc} · {stage_group}")
+        elif status in ("SCHEDULED", "TIMED") and match_dt_utc > now_utc:
+            # Only show as upcoming if kickoff hasn't passed yet
+            match_dt_local = match_dt_utc.astimezone(user_tz)
+            time_esc = _escape(match_dt_local.strftime('%I:%M %p'))
+            tz_esc = _escape(tz_str)
+            upcoming.append(f"• {home_esc} vs {away_esc} — {time_esc} \\({tz_esc}\\) · {stage_group}")
+        elif status in ("SCHEDULED", "TIMED") and match_dt_utc <= now_utc:
+            # Kickoff time has passed but API hasn't updated status yet
+            elapsed_mins = int((now_utc - match_dt_utc).total_seconds() // 60)
+            if elapsed_mins <= 130:
+                elapsed_esc = _escape(f"~{elapsed_mins}'")
+                h_score = m.get("score.fullTime.home")
+                a_score = m.get("score.fullTime.away")
+                if h_score is not None and a_score is not None:
+                    score_str = f"{_escape(str(h_score))} – {_escape(str(a_score))}"
+                    live.append(f"• {home_esc} {score_str} {away_esc} \\({elapsed_esc}\\) · {stage_group}")
+                else:
+                    live.append(f"• {home_esc} vs {away_esc} \\({elapsed_esc}\\) · {stage_group}")
             
     parts = [f"📅 *World Cup Matches Today — {_escape(target_date.strftime('%d %B %Y'))}*"]
-    if upcoming:
-        parts.append("🟢 UPCOMING\n" + "\n".join(upcoming))
     if live:
         parts.append("🔴 LIVE NOW\n" + "\n".join(live))
+    if upcoming:
+        parts.append("🟢 UPCOMING\n" + "\n".join(upcoming))
     if finished:
         parts.append("✅ FINISHED\n" + "\n".join(finished))
         
+    await send_text(context.application, chat_id, "\n\n".join(parts))
+
+async def tomorrow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    user_tz, tz_str = _get_user_tz(chat_id)
+
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
+
+    target_date = (datetime.now(user_tz) + timedelta(days=1)).date()
+
+    tomorrow_matches = []
+    for m in all_matches:
+        utc_date_str = m.get("utcDate", "")
+        if not utc_date_str:
+            continue
+        match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
+        if match_dt.date() == target_date:
+            tomorrow_matches.append(m)
+
+    if not tomorrow_matches:
+        await send_text(context.application, chat_id, "No World Cup matches tomorrow\\.")
+        return
+
+    tomorrow_matches.sort(key=lambda x: x.get("utcDate", ""))
+
+    upcoming = []
+    finished = []  # Edge case: late-night match that tips into "tomorrow" for some timezones
+
+    tz_esc = _escape(tz_str)
+    for m in tomorrow_matches:
+        status = m.get("status")
+        home_esc = _escape(m.get("homeTeam.name", "TBD"))
+        away_esc = _escape(m.get("awayTeam.name", "TBD"))
+        stage = _format_stage(m.get("stage", ""))
+        group = _format_group(m.get("group"))
+        stage_group = _escape(f"{stage} \u00b7 {group}" if group else stage)
+        match_dt_local = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(user_tz)
+        time_esc = _escape(match_dt_local.strftime('%I:%M %p'))
+
+        if status in ("FINISHED", "AWARDED"):
+            h_score = _escape(str(m.get("score.fullTime.home") or 0))
+            a_score = _escape(str(m.get("score.fullTime.away") or 0))
+            finished.append(f"\u2022 {home_esc} {h_score} \u2013 {a_score} {away_esc} \u00b7 {stage_group}")
+        else:
+            upcoming.append(f"\u2022 {home_esc} vs {away_esc} \u2014 {time_esc} \\({tz_esc}\\) \u00b7 {stage_group}")
+
+    parts = [f"\U0001f4c5 *World Cup Matches Tomorrow \u2014 {_escape(target_date.strftime('%d %B %Y'))}*"]
+    if upcoming:
+        parts.append("\U0001f7e2 UPCOMING\n" + "\n".join(upcoming))
+    if finished:
+        parts.append("\u2705 FINISHED\n" + "\n".join(finished))
+
     await send_text(context.application, chat_id, "\n\n".join(parts))
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -435,6 +747,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders_on = "On" if state.get_setting(chat_id, "reminders_enabled") != "false" else "Off"
     myscores_on = "On" if state.get_setting(chat_id, "my_scores_enabled") != "false" else "Off"
     allscores_on = "On" if state.get_setting(chat_id, "all_scores_enabled") != "false" else "Off"
+    livegoals_on = "On" if state.get_setting(chat_id, "live_goals_enabled") != "false" else "Off"
     tz_str = state.get_setting(chat_id, "timezone") or "UTC"
     
     msg = (
@@ -444,6 +757,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔔 Pre\\-match reminders: *{reminders_on}*\n"
         f"⭐ My team results: *{myscores_on}*\n"
         f"🌍 All match results: *{allscores_on}*\n"
+        f"⚽ Live goal alerts: *{livegoals_on}*\n"
         f"🕐 Timezone: *{_escape(tz_str)}*"
     )
     await send_text(context.application, chat_id, msg)
@@ -453,9 +767,13 @@ async def syncnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_text(context.application, chat_id, "🔄 Syncing…")
     
-    # Run sync in background so we don't block
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, scheduler.sync_schedule, context.application)
+    try:
+        # Run sync in background so we don't block
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, scheduler.sync_schedule, context.application)
+    except RateLimitException:
+        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
+        return
     
     # Get stats
     jobs = scheduler._scheduler.get_jobs()
@@ -477,6 +795,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     jobs = scheduler._scheduler.get_jobs()
     active_jobs = len(jobs)
+    live_poller_active = scheduler._scheduler.get_job("live_poller") is not None
     
     next_job = None
     next_time = None
@@ -489,16 +808,20 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_tz, tz_str = _get_user_tz(chat_id)
             next_time = first.next_run_time.astimezone(user_tz).strftime('%I:%M:%S %p')
             
+    live_status_str = "Running \\(10s\\)" if live_poller_active else "Idle"
+    live_icon = "🟢" if live_poller_active else "⚫"
     msg = (
         "🤖 *Bot Status*\n\n"
         f"⏱ Uptime: *{_escape(uptime_str)}*\n"
         f"📡 API quota remaining: *{_escape(str(rem_quota))} / 10*\n"
         f"📅 Active scheduler jobs: *{_escape(str(active_jobs))}*\n"
+        f"⚽ Live goal poller: {live_icon} *{live_status_str}*\n"
     )
     if next_job and next_time:
         msg += f"🔜 Next job: *{_escape(next_job)}* at *{_escape(next_time)}*"
         
     await send_text(context.application, chat_id, msg)
+
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -536,10 +859,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /reminders \\[on\\|off\\] — Toggle pre\\-match reminders\n"
         "• /setreminder <minutes\\> — Set minutes before kickoff to remind\n"
         "• /myscores \\[on\\|off\\] — Toggle results for your teams\n"
-        "• /allscores \\[on\\|off\\] — Toggle results for all matches\n\n"
+        "• /allscores \\[on\\|off\\] — Toggle results for all matches\n"
+        "• /livegoals \\[on\\|off\\] — Toggle live in\\-match goal alerts\n\n"
         "*Match Info*\n"
         "• /today — Matches happening today\n"
+        "• /tomorrow — Matches scheduled for tomorrow\n"
         "• /live — Matches currently in progress\n"
+        "• /fixture — Full tournament fixture\n"
         "• /nextmatch — Your teams' next match\n"
         "• /matches — Your teams' full schedule\n"
         "• /results \\[date\\] — Finished matches \\(today, yesterday, or YYYY\\-MM\\-DD\\)\n\n"
@@ -548,6 +874,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /status — View bot diagnostics\n"
         "• /stats — Track bot usage and total users\n"
         "• /help — Show this message"
+    )
+    await send_text(context.application, chat_id, msg)
+
+async def fallback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replies to any unrecognised text or unknown command with a helpful nudge."""
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+
+    # Show the first 30 chars of what they typed so the reply feels personal
+    preview = user_text[:30] + ("…" if len(user_text) > 30 else "")
+    preview_esc = _escape(preview)
+
+    msg = (
+        f"🤔 I don't understand *{preview_esc}*\\.\n\n"
+        "I only respond to commands\\. Use /help to see everything I can do\\."
     )
     await send_text(context.application, chat_id, msg)
 
@@ -565,19 +906,27 @@ def main():
     application.add_handler(CommandHandler("reminders", reminders_cmd))
     application.add_handler(CommandHandler("myscores", myscores_cmd))
     application.add_handler(CommandHandler("allscores", allscores_cmd))
+    application.add_handler(CommandHandler("livegoals", livegoals_cmd))
     application.add_handler(CommandHandler("setreminder", setreminder_cmd))
     application.add_handler(CommandHandler("settimezone", settimezone_cmd))
     application.add_handler(CommandHandler("nextmatch", nextmatch_cmd))
     application.add_handler(CommandHandler("matches", matches_cmd))
     application.add_handler(CommandHandler("results", results_cmd))
     application.add_handler(CommandHandler("live", live_cmd))
+    application.add_handler(CommandHandler("fixture", fixture_cmd))
     application.add_handler(CommandHandler("today", today_cmd))
+    application.add_handler(CommandHandler("tomorrow", tomorrow_cmd))
     application.add_handler(CommandHandler("settings", settings_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("syncnow", syncnow_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
+
+    # Catch-all: must be registered LAST so all command handlers take priority
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_cmd))
+    # Also catch unknown /commands not handled above
+    application.add_handler(MessageHandler(filters.COMMAND, fallback_cmd))
     
     sched = scheduler.start_scheduler(application)
     application.bot_data["scheduler"] = sched

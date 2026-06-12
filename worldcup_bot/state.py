@@ -16,6 +16,7 @@ _DEFAULTS = {
     "reminders_enabled": "true",
     "my_scores_enabled": "true",
     "all_scores_enabled": "true",
+    "live_goals_enabled": "true",
     "reminder_minutes_before": "60",
     "timezone": "UTC",
     "favourite_teams": "[]"

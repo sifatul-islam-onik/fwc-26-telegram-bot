@@ -130,6 +130,38 @@ def get_all_wc_matches() -> list[dict]:
         
     return [_normalise(m) for m in data["matches"]]
 
+def get_live_matches() -> list[dict]:
+    """Returns only matches that are currently live or probably live.
+
+    Uses one API call (all WC matches) and filters locally.
+    'Probably live' covers the free-tier lag where status stays TIMED/SCHEDULED
+    even after kickoff — any match whose kickoff was 0-130 minutes ago and
+    hasn't been marked FINISHED/AWARDED/CANCELLED/POSTPONED.
+    """
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    LIVE_STATUSES = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
+    FINISHED_STATUSES = ("FINISHED", "AWARDED", "CANCELLED", "POSTPONED")
+
+    all_matches = get_all_wc_matches()   # single network call
+    now_utc = _dt.now(_tz.utc)
+    live = []
+
+    for m in all_matches:
+        status = m.get("status")
+        if status in LIVE_STATUSES:
+            live.append(m)
+        elif status not in FINISHED_STATUSES:
+            utc_date_str = m.get("utcDate")
+            if utc_date_str:
+                match_dt = _dt.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                elapsed = (now_utc - match_dt).total_seconds()
+                if 0 <= elapsed <= 130 * 60:
+                    live.append(m)
+
+    return live
+
 def get_match(match_id: int) -> dict | None:
     """Returns a single match object."""
     url = f"{BASE_URL}/matches/{match_id}"

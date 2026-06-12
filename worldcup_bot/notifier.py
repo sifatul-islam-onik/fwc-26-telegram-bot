@@ -200,3 +200,72 @@ async def send_result(application, match: dict):
             
     # Mark global notification as complete
     state.mark_notified(match_id, "result")
+
+async def send_goal_alert(application, match: dict, prev_home: int, prev_away: int):
+    """Broadcasts a ⚽ GOAL alert to all registered users when the score changes.
+
+    Notifies everyone regardless of favourite teams, but respects each user's
+    my_scores_enabled / all_scores_enabled toggles.
+    """
+    match_id = match.get("id")
+    home_id = match.get("homeTeam.id")
+    away_id = match.get("awayTeam.id")
+    home = match.get("homeTeam.name", "TBD")
+    away = match.get("awayTeam.name", "TBD")
+
+    new_home = match.get("score.fullTime.home") or 0
+    new_away = match.get("score.fullTime.away") or 0
+
+    stage = _format_stage(match.get("stage", ""))
+    group = _format_group(match.get("group"))
+    stage_group = _escape(f"{stage} · {group}" if group else stage)
+    home_esc = _escape(home)
+    away_esc = _escape(away)
+    h_score_esc = _escape(str(new_home))
+    a_score_esc = _escape(str(new_away))
+
+    # Determine who scored
+    scorer_line = ""
+    if new_home > prev_home:
+        goals = new_home - prev_home
+        scorer_line = f"\n⚽ *{home_esc}* scored\\!"
+        if goals > 1:
+            scorer_line += f" \\(\\+{_escape(str(goals))}\\)"
+    elif new_away > prev_away:
+        goals = new_away - prev_away
+        scorer_line = f"\n⚽ *{away_esc}* scored\\!"
+        if goals > 1:
+            scorer_line += f" \\(\\+{_escape(str(goals))}\\)"
+
+    msg = (
+        "🚨 *GOAL\\!*\n\n"
+        f"🏆 FIFA World Cup · {stage_group}\n"
+        f"🆚 *{home_esc}* {h_score_esc} – {a_score_esc} *{away_esc}*"
+        f"{scorer_line}"
+    )
+
+    users = state.get_all_users()
+    for chat_id in users:
+        # Respect the live goal alert toggle first
+        if state.get_setting(chat_id, "live_goals_enabled") == "false":
+            continue
+
+        fav_teams = state.get_favourite_teams(chat_id)
+        fav_ids = [t["id"] for t in fav_teams]
+        match_involves_fav = (home_id in fav_ids or away_id in fav_ids)
+
+        # Respect notification toggles
+        if match_involves_fav and state.get_setting(chat_id, "my_scores_enabled") == "false":
+            continue
+        if not match_involves_fav and state.get_setting(chat_id, "all_scores_enabled") == "false":
+            continue
+
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode="MarkdownV2"
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send goal alert for match {match_id} to {chat_id}: {e}")
+

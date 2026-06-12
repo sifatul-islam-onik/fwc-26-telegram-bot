@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 # Module-level variable
 _scheduler: BackgroundScheduler = None
 
+# In-memory score cache: {match_id: (home_score, away_score)}
+# Used by the live-goal poller to detect score changes between polls.
+_live_score_cache: dict[int, tuple[int, int]] = {}
+
 def _run_async(coro):
     """Helper to run async functions from APScheduler's synchronous workers."""
     try:
@@ -135,6 +139,8 @@ def sync_schedule(application):
                 replace_existing=True
             )
             pollers_count += 1
+            # Ensure live-goal poller is active
+            _arm_live_poller(application)
             
         elif match_dt > now_utc:
             startpoll_job_id = f"startpoll_{match_id}"
@@ -160,6 +166,28 @@ def _arm_result_poller(application, match_id: int, home_name: str, away_name: st
             id=job_id,
             replace_existing=True
         )
+    # Also make sure the live-goal poller is running
+    _arm_live_poller(application)
+
+
+def _arm_live_poller(application):
+    """Ensures the 10-second live-goal poller job is running."""
+    if _scheduler and not _scheduler.get_job("live_poller"):
+        _scheduler.add_job(
+            func=_poll_live_goals,
+            trigger=IntervalTrigger(seconds=10),
+            args=[application],
+            id="live_poller",
+            replace_existing=True
+        )
+        logger.info("Live-goal poller armed (10-second interval).")
+
+
+def _stop_live_poller():
+    """Removes the live-goal poller when no matches are active."""
+    if _scheduler and _scheduler.get_job("live_poller"):
+        _scheduler.remove_job("live_poller")
+        logger.info("Live-goal poller stopped (no live matches).")
 
 def _poll_result(application, match_id: int, home: str, away: str):
     try:
@@ -182,6 +210,9 @@ def _poll_result(application, match_id: int, home: str, away: str):
         startpoll_job_id = f"startpoll_{match_id}"
         if _scheduler.get_job(poll_job_id): _scheduler.remove_job(poll_job_id)
         if _scheduler.get_job(startpoll_job_id): _scheduler.remove_job(startpoll_job_id)
+
+        # Clean up score cache entry for this match
+        _live_score_cache.pop(match_id, None)
         return
         
     # Safety cutoff (180 mins)
@@ -193,6 +224,57 @@ def _poll_result(application, match_id: int, home: str, away: str):
             logger.warning(f"Safety cutoff reached for match {match_id}. Removing poller.")
             poll_job_id = f"poll_{match_id}"
             if _scheduler.get_job(poll_job_id): _scheduler.remove_job(poll_job_id)
+            _live_score_cache.pop(match_id, None)
+
+
+def _poll_live_goals(application):
+    """Polls all currently live WC matches every 10 seconds and sends a goal
+    alert to all users whenever the score changes for any match.
+
+    Uses a single API call (get_live_matches) to minimise API usage.
+    Stops itself automatically when no matches are live.
+    """
+    try:
+        live_matches = football_api.get_live_matches()
+    except football_api.RateLimitException as e:
+        logger.warning(f"Live-goal poller rate-limited. Skipping this tick. (Wait {e.retry_after}s)")
+        return
+
+    if not live_matches:
+        # No live matches — shut down the poller to save API quota
+        _stop_live_poller()
+        return
+
+    for match in live_matches:
+        match_id = match.get("id")
+        if not match_id:
+            continue
+
+        new_home = match.get("score.fullTime.home")
+        new_away = match.get("score.fullTime.away")
+
+        # Skip if score is not available (free-tier may omit it)
+        if new_home is None or new_away is None:
+            continue
+
+        new_home = int(new_home)
+        new_away = int(new_away)
+
+        prev = _live_score_cache.get(match_id)
+        if prev is None:
+            # First time we see this match — seed the cache, don't alert
+            _live_score_cache[match_id] = (new_home, new_away)
+            continue
+
+        prev_home, prev_away = prev
+        if new_home != prev_home or new_away != prev_away:
+            # Score changed — fire goal alert and update cache
+            logger.info(
+                f"GOAL detected in match {match_id}: "
+                f"{prev_home}-{prev_away} -> {new_home}-{new_away}"
+            )
+            _live_score_cache[match_id] = (new_home, new_away)
+            _run_async(notifier.send_goal_alert(application, match, prev_home, prev_away))
 
 def _sync_schedule_background(application):
     try:
@@ -222,5 +304,9 @@ def start_scheduler(application):
         id="sync_schedule_startup",
         replace_existing=True
     )
+
+    # Arm the live-goal poller immediately — it will stop itself
+    # if there are no live matches and re-arm when a match goes live.
+    _arm_live_poller(application)
     
     return _scheduler
