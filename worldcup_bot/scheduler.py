@@ -21,15 +21,27 @@ _scheduler: BackgroundScheduler = None
 # Used by the live-goal poller to detect score changes between polls.
 _live_score_cache: dict[int, tuple[int, int]] = {}
 
-def _run_async(coro):
-    """Helper to run async functions from APScheduler's synchronous workers."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+def _run_async(application, coro):
+    """Helper to run async functions from APScheduler's synchronous workers
+    on the application's main event loop.
+    """
+    loop = application.bot_data.get("main_loop")
+    if not loop:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
 
     if loop and loop.is_running():
-        asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            curr_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            curr_loop = None
+
+        if curr_loop == loop:
+            loop.create_task(coro)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop)
     else:
         asyncio.run(coro)
 
@@ -91,7 +103,7 @@ def sync_schedule(application):
                         
                     def make_reminder_func(app, c_id, m):
                         def wrapper():
-                            _run_async(notifier.send_reminder(app, c_id, m))
+                            _run_async(app, notifier.send_reminder(app, c_id, m))
                         return wrapper
                     
                     _scheduler.add_job(
@@ -120,7 +132,7 @@ def sync_schedule(application):
         away_name = match.get("awayTeam.name", "TBD")
         
         if status in ("FINISHED", "AWARDED", "CANCELLED"):
-            _run_async(notifier.send_result(application, match))
+            _run_async(application, notifier.send_result(application, match))
             state.mark_notified(match_id, 'result')
             continue
             
@@ -198,7 +210,7 @@ def _poll_result(application, match_id: int, home: str, away: str):
     status = match.get("status")
     
     if status in ("FINISHED", "AWARDED", "CANCELLED"):
-        _run_async(notifier.send_result(application, match))
+        _run_async(application, notifier.send_result(application, match))
         state.mark_notified(match_id, 'result')
         
         poll_job_id = f"poll_{match_id}"
@@ -291,7 +303,7 @@ def _poll_live_goals(application):
                 f"{prev_home}-{prev_away} -> {new_home}-{new_away}"
             )
             _live_score_cache[match_id] = (new_home, new_away)
-            _run_async(notifier.send_goal_alert(application, match, prev_home, prev_away))
+            _run_async(application, notifier.send_goal_alert(application, match, prev_home, prev_away))
 
     # Detect finished matches (in _live_score_cache but not in live_matches)
     for cached_id in list(_live_score_cache.keys()):
@@ -302,7 +314,7 @@ def _poll_live_goals(application):
                 if status in ("FINISHED", "AWARDED", "CANCELLED"):
                     if not state.is_notified(cached_id, "result"):
                         logger.info(f"Match {cached_id} finished. Sending result notification.")
-                        _run_async(notifier.send_result(application, finished_match))
+                        _run_async(application, notifier.send_result(application, finished_match))
                         state.mark_notified(cached_id, "result")
                         
                         # Clean up jobs for this match

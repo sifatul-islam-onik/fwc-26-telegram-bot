@@ -1863,10 +1863,13 @@ async def clear_state_pre_handler(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("awaiting_results_date", None)
         context.user_data.pop("menu_message_id", None)
 
+async def post_init(application):
+    application.bot_data["main_loop"] = asyncio.get_running_loop()
+
 def main():
     state._init_db()
     
-    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     
     application.add_error_handler(error_handler)
     
