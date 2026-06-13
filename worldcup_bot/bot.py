@@ -524,151 +524,173 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await _get_live_text()
     await send_text(context.application, chat_id, msg)
 
-async def fixture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the full tournament fixture grouped by stage and group."""
-    chat_id = update.effective_chat.id
+async def _get_fixture_selection_text(chat_id: int, stage_keys: list[str], group_key: str = None) -> str:
     user_tz, tz_str = _get_user_tz(chat_id)
-    now_utc = datetime.now(pytz.utc)
-
     try:
         all_matches = football_api.get_all_wc_matches()
     except RateLimitException:
-        await send_text(context.application, chat_id, RATE_LIMIT_MSG)
-        return
-
+        return RATE_LIMIT_MSG
+        
     if not all_matches:
-        await send_text(context.application, chat_id, "No fixture data available yet\\.")
-        return
-
-    # Sort matches chronologically
-    all_matches.sort(key=lambda m: m.get("utcDate", ""))
-
-    # Stage display order — covers both old ROUND_OF_* and new LAST_* names used
-    # by the football-data.org API for the expanded 48-team WC 2026 format.
-    STAGE_ORDER = [
-        "GROUP_STAGE",
-        "ROUND_OF_32", "LAST_32",
-        "ROUND_OF_16", "LAST_16",
-        "QUARTER_FINALS",
-        "SEMI_FINALS",
-        "THIRD_PLACE",
-        "FINAL"
-    ]
-    LIVE_STATUSES = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
-    FINISHED_STATUSES = ("FINISHED", "AWARDED", "CANCELLED")
-
-    # Group matches: {stage -> {group_label -> [matches]}}
-    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-    stages_seen = []
-
+        return "No fixture data available yet\\."
+        
+    selected_matches = []
     for m in all_matches:
-        stage = m.get("stage") or "UNKNOWN"
-        group = m.get("group")  # None for knockout stages
-        group_label = _format_group(group) if group else ""
-
-        if stage not in stages_seen:
-            stages_seen.append(stage)
-        grouped[stage][group_label].append(m)
-
-    # Build message chunks (split at ~4000 chars to stay under Telegram 4096 limit)
-    MAX_CHUNK = 4000
-    chunks: list[str] = []
-    current = "\U0001f4cb *FIFA World Cup 2026 — Full Fixture*\n"
-    current += f"_Times shown in {_escape(tz_str)}_\n"
-
-    # Iterate stages in defined order, then any extras
-    ordered_stages = [s for s in STAGE_ORDER if s in grouped]
-    ordered_stages += [s for s in stages_seen if s not in ordered_stages]
-
-    for stage in ordered_stages:
-        stage_label = _escape(_format_stage(stage))
-        groups_in_stage = grouped[stage]
-
-        # Sort groups alphabetically (empty string = knockout, comes first in that context)
-        sorted_groups = sorted(groups_in_stage.keys())
-
-        for group_label in sorted_groups:
-            matches_in_group = groups_in_stage[group_label]
-
-            # Section header
-            if group_label:
-                header = f"\n\n\u2501\u2501 *{stage_label} \u00b7 {_escape(group_label)}* \u2501\u2501"
+        stage = m.get("stage", "")
+        if stage in stage_keys:
+            if group_key is not None:
+                if m.get("group") == group_key:
+                    selected_matches.append(m)
             else:
-                header = f"\n\n\u2501\u2501 *{stage_label}* \u2501\u2501"
-
-            if len(current) + len(header) > MAX_CHUNK:
-                chunks.append(current)
-                current = header + "\n"
-            else:
-                current += header + "\n"
-
-            for m in matches_in_group:
-                status = m.get("status", "")
-                home = m.get("homeTeam.name") or "TBD"
-                away = m.get("awayTeam.name") or "TBD"
-                home_esc = _escape(home)
-                away_esc = _escape(away)
-
-                utc_date_str = m.get("utcDate", "")
+                selected_matches.append(m)
+                
+    if not selected_matches:
+        return "No matches found for the selected stage\\."
+        
+    selected_matches.sort(key=lambda x: x.get("utcDate", ""))
+    
+    stage_label = _format_stage(stage_keys[0])
+    if group_key:
+        group_label = _format_group(group_key)
+        header = f"🏆 *{_escape(stage_label)} — {_escape(group_label)} \\({_escape(tz_str)}\\)*\n\n"
+    else:
+        header = f"🏆 *{_escape(stage_label)} \\({_escape(tz_str)}\\)*\n\n"
+        
+    cards = []
+    current_len = len(header) + 10
+    for m in selected_matches:
+        status = m.get("status", "")
+        home = m.get("homeTeam.name") or "TBD"
+        away = m.get("awayTeam.name") or "TBD"
+        h_score = m.get("score.fullTime.home")
+        a_score = m.get("score.fullTime.away")
+        
+        status_str = None
+        score_val = None
+        time_str = None
+        date_str = None
+        
+        if status in ("FINISHED", "AWARDED", "CANCELLED"):
+            status_str = "✅ FINISHED"
+            score_val = f"{h_score or 0} - {a_score or 0}"
+        elif status in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT"):
+            status_str = "🔴 LIVE"
+            score_val = f"{h_score or 0} - {a_score or 0}"
+        else:
+            utc_date_str = m.get("utcDate", "")
+            is_probably_live = False
+            if utc_date_str:
+                m_dt_utc = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                elapsed = (datetime.now(pytz.utc) - m_dt_utc).total_seconds()
+                if 0 < elapsed <= 130 * 60:
+                    is_probably_live = True
+                    status_str = f"🟡 IN PROGRESS (~{int(elapsed // 60)}')"
+                    score_val = f"{h_score or 0} - {a_score or 0}"
+            
+            if not is_probably_live:
                 if utc_date_str:
-                    match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
-                    date_str = _escape(match_dt.strftime("%a %d %b"))
-                    time_str = _escape(match_dt.strftime("%H:%M"))
+                    match_dt_local = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00")).astimezone(user_tz)
+                    time_str = match_dt_local.strftime('%I:%M %p')
+                    date_str = match_dt_local.strftime('%a %d %b')
                 else:
-                    date_str = _escape("TBD")
-                    time_str = ""
+                    time_str = "TBD"
+                    
+        card_stage = _format_stage(m.get("stage", ""))
+        if m.get("group"):
+            card_stage = f"{card_stage} · {_format_group(m.get('group'))}"
+            
+        card = _make_monospace_card(
+            stage_group=card_stage,
+            home=home,
+            away=away,
+            time_str=time_str,
+            date_str=date_str,
+            status_str=status_str,
+            score_str=score_val
+        )
+        
+        if current_len + len(card) + 5 > 4000:
+            break
+        cards.append(card)
+        current_len += len(card) + 2
+        
+    cards_text = "\n\n".join(cards)
+    return f"{header}```\n{cards_text}\n```"
 
-                h_score = m.get("score.fullTime.home")
-                a_score = m.get("score.fullTime.away")
+async def show_fixture_stages_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+    chat_id = update.effective_chat.id if (update and update.effective_chat) else query.message.chat_id
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("👕 Group Stage", callback_data="fixture:groups"),
+        ],
+        [
+            InlineKeyboardButton("Last 32 (Round of 32)", callback_data="fixture:stage:ROUND_OF_32:LAST_32"),
+            InlineKeyboardButton("Last 16 (Round of 16)", callback_data="fixture:stage:ROUND_OF_16:LAST_16")
+        ],
+        [
+            InlineKeyboardButton("Quarter Finals", callback_data="fixture:stage:QUARTER_FINALS"),
+            InlineKeyboardButton("Semi Finals", callback_data="fixture:stage:SEMI_FINALS")
+        ],
+        [
+            InlineKeyboardButton("Third Place", callback_data="fixture:stage:THIRD_PLACE"),
+            InlineKeyboardButton("Final", callback_data="fixture:stage:FINAL")
+        ],
+        [
+            InlineKeyboardButton("◀️ Back to Schedule", callback_data="menu:schedule")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = "🏆 *Tournament Fixture Stages*\n\nSelect a stage to view its match schedule:"
+    if query:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="MarkdownV2")
+    else:
+        await send_text(context.application, chat_id, text, reply_markup=reply_markup)
 
-                if status in FINISHED_STATUSES:
-                    icon = "\u2705"  # ✅
-                    if h_score is not None and a_score is not None:
-                        score_part = f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
-                    else:
-                        score_part = f"*{home_esc}* vs *{away_esc}*"
-                elif status in LIVE_STATUSES:
-                    icon = "\U0001f534"  # 🔴
-                    if h_score is not None and a_score is not None:
-                        score_part = f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
-                    else:
-                        score_part = f"*{home_esc}* vs *{away_esc}*"
-                elif utc_date_str and status in ("TIMED", "SCHEDULED"):
-                    m_dt_utc = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
-                    elapsed = (now_utc - m_dt_utc).total_seconds()
-                    if 0 < elapsed <= 130 * 60:  # Probably live (free-tier lag)
-                        icon = "\U0001f7e1"  # 🟡
-                        elapsed_mins = int(elapsed // 60)
-                        if h_score is not None and a_score is not None:
-                            score_part = (
-                                f"*{home_esc}* {_escape(str(h_score))} \u2013 {_escape(str(a_score))} *{away_esc}*"
-                                f" _\\(\u007e{_escape(str(elapsed_mins))}'\\)_"
-                            )
-                        else:
-                            score_part = f"*{home_esc}* vs *{away_esc}*"
-                    else:
-                        icon = "\U0001f551"  # 🕑
-                        score_part = f"*{home_esc}* vs *{away_esc}*"
-                else:
-                    icon = "\U0001f551"  # 🕑
-                    score_part = f"*{home_esc}* vs *{away_esc}*"
+async def show_fixture_groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+    chat_id = update.effective_chat.id if (update and update.effective_chat) else query.message.chat_id
+    
+    try:
+        all_matches = football_api.get_all_wc_matches()
+    except RateLimitException:
+        msg = RATE_LIMIT_MSG
+        if query:
+            await query.edit_message_text(msg, parse_mode="MarkdownV2")
+        else:
+            await send_text(context.application, chat_id, msg)
+        return
+        
+    groups = set()
+    for m in all_matches:
+        if m.get("stage") == "GROUP_STAGE" and m.get("group"):
+            groups.add(m.get("group"))
+            
+    sorted_groups = sorted(list(groups))
+    
+    keyboard = []
+    row = []
+    for g_key in sorted_groups:
+        g_label = _format_group(g_key)
+        btn = InlineKeyboardButton(g_label, callback_data=f"fixture:group:{g_key}")
+        row.append(btn)
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+        
+    keyboard.append([InlineKeyboardButton("◀️ Back to Stages", callback_data="menu:info_fixture")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = "👕 *Group Stage Selection*\n\nSelect a group to view its fixture:"
+    if query:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="MarkdownV2")
+    else:
+        await send_text(context.application, chat_id, text, reply_markup=reply_markup)
 
-                if time_str:
-                    line = f"{icon} `{date_str}` {time_str} \u2014 {score_part}\n"
-                else:
-                    line = f"{icon} {score_part}\n"
-
-                if len(current) + len(line) > MAX_CHUNK:
-                    chunks.append(current)
-                    current = line
-                else:
-                    current += line
-
-    if current.strip():
-        chunks.append(current)
-
-    for chunk in chunks:
-        await send_text(context.application, chat_id, chunk)
+async def fixture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows the interactive tournament fixture stages selection menu."""
+    await show_fixture_stages_menu(update, context)
 
 async def _get_today_text(chat_id: int) -> str:
     user_tz, tz_str = _get_user_tz(chat_id)
@@ -1013,9 +1035,84 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_master_menu(update, context)
 
 async def fallback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Replies to any unrecognised text or unknown command with a helpful nudge."""
+    """Replies to any unrecognised text or unknown command with a helpful nudge, or processes custom results dates."""
+    if not update or not update.message:
+        return
     chat_id = update.effective_chat.id
     user_text = (update.message.text or "").strip()
+
+    if context.user_data.get("awaiting_results_date"):
+        context.user_data.pop("awaiting_results_date", None)
+        menu_message_id = context.user_data.pop("menu_message_id", None)
+        
+        # Delete user's typed message to keep the chat clean
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Could not delete user message: {e}")
+            
+        # Try parsing target date (year is always 2026, user enters DD-MM)
+        date_str = f"2026-{user_text}"
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%d-%m").date()
+        except ValueError:
+            msg = "❌ *Invalid date format*\\. Please use **DD\\-MM** format \\(e\\.g\\. `14-06`\\)\\."
+            keyboard = [
+                [InlineKeyboardButton("📅 Try Again", callback_data="menu:results_custom_prompt")],
+                [InlineKeyboardButton("◀️ Back to Results", callback_data="menu:results_menu")]
+            ]
+            if menu_message_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=menu_message_id,
+                        text=msg,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="MarkdownV2"
+                    )
+                    return
+                except TelegramError as e:
+                    logger.error(f"Failed to edit menu on invalid date format: {e}")
+            await send_text(context.application, chat_id, msg, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+            
+        keyboard = [[InlineKeyboardButton("◀️ Back to Results", callback_data="menu:results_menu")]]
+        formatted_date_str = target_date.strftime("%Y-%m-%d")
+        
+        if menu_message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=menu_message_id,
+                    text="⏳ Fetching match results…",
+                    parse_mode="MarkdownV2"
+                )
+            except TelegramError as e:
+                logger.error(f"Failed to edit loading message: {e}")
+                
+            results_text = await _get_results_text(chat_id, formatted_date_str)
+            
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=menu_message_id,
+                    text=results_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="MarkdownV2"
+                )
+                return
+            except TelegramError as e:
+                logger.error(f"Failed to edit results message: {e}")
+                
+        # Fallback to sending new message if menu_message_id not found or edit fails
+        status_msg = await send_text(context.application, chat_id, "⏳ Fetching match results…")
+        results_text = await _get_results_text(chat_id, formatted_date_str)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except Exception as e:
+            logger.warning(f"Could not delete status message: {e}")
+        await send_text(context.application, chat_id, results_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
     # Show the first 30 chars of what they typed so the reply feels personal
     preview = user_text[:30] + ("…" if len(user_text) > 30 else "")
@@ -1025,6 +1122,7 @@ async def fallback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤔 I don't understand *{preview_esc}*\\.\n\n"
         "I only respond to commands\\. Use /help to see everything I can do\\."
     )
+    await send_text(context.application, chat_id, msg)
 TIMEZONES_BY_REGION = {
     "Africa": ["Africa/Cairo", "Africa/Lagos", "Africa/Johannesburg", "Africa/Nairobi", "Africa/Casablanca", "Africa/Algiers"],
     "America": ["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles", "America/Mexico_City", "America/Sao_Paulo", "America/Argentina/Buenos_Aires", "America/Bogota"],
@@ -1035,6 +1133,10 @@ TIMEZONES_BY_REGION = {
 
 async def show_master_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
     chat_id = update.effective_chat.id if (update and update.effective_chat) else query.message.chat_id
+    
+    # Clean up custom date state when showing master menu
+    context.user_data.pop("awaiting_results_date", None)
+    context.user_data.pop("menu_message_id", None)
     
     keyboard = [
         [
@@ -1136,6 +1238,9 @@ async def show_results_date_menu(query, context):
         [
             InlineKeyboardButton("Today's Results", callback_data="menu:info_results:today"),
             InlineKeyboardButton("Yesterday's Results", callback_data="menu:info_results:yesterday")
+        ],
+        [
+            InlineKeyboardButton("📅 Custom Date", callback_data="menu:results_custom_prompt")
         ],
         [
             InlineKeyboardButton("◀️ Back to Schedule", callback_data="menu:schedule")
@@ -1408,6 +1513,11 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     chat_id = query.message.chat_id
     data = query.data
     
+    # Clean up custom date state if user navigates away using buttons
+    if data != "menu:results_custom_prompt":
+        context.user_data.pop("awaiting_results_date", None)
+        context.user_data.pop("menu_message_id", None)
+        
     # 1. Master Menu navigation
     if data == "menu:main":
         await show_master_menu(update, context, query=query)
@@ -1430,7 +1540,19 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
         
     if data == "menu:results_menu":
+        context.user_data.pop("awaiting_results_date", None)
         await show_results_date_menu(query, context)
+        return
+        
+    if data == "menu:results_custom_prompt":
+        context.user_data["awaiting_results_date"] = True
+        context.user_data["menu_message_id"] = query.message.message_id
+        keyboard = [[InlineKeyboardButton("◀️ Cancel", callback_data="menu:results_menu")]]
+        await query.edit_message_text(
+            "📅 *Select Custom Date*\n\nPlease enter the date in **DD\\-MM** format \\(e\\.g\\. `14-06` or `05-07`\\):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="MarkdownV2"
+        )
         return
         
     if data == "menu:close":
@@ -1519,8 +1641,28 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
         
     if data == "menu:info_fixture":
-        await query.edit_message_text("📋 Sending the full fixture list to the chat…", parse_mode="MarkdownV2")
-        await fixture_cmd(update, context)
+        await show_fixture_stages_menu(update, context, query=query)
+        return
+        
+    if data == "fixture:groups":
+        await show_fixture_groups_menu(update, context, query=query)
+        return
+        
+    if data.startswith("fixture:stage:"):
+        await query.edit_message_text("⏳ Fetching stage fixtures…", parse_mode="MarkdownV2")
+        parts = data.split(":")
+        stage_keys = parts[2:]
+        text = await _get_fixture_selection_text(chat_id, stage_keys)
+        keyboard = [[InlineKeyboardButton("◀️ Back to Stages", callback_data="menu:info_fixture")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="MarkdownV2")
+        return
+        
+    if data.startswith("fixture:group:"):
+        await query.edit_message_text("⏳ Fetching group fixtures…", parse_mode="MarkdownV2")
+        group_key = data.split(":")[2]
+        text = await _get_fixture_selection_text(chat_id, ["GROUP_STAGE"], group_key=group_key)
+        keyboard = [[InlineKeyboardButton("◀️ Back to Groups", callback_data="fixture:groups")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="MarkdownV2")
         return
         
     if data.startswith("menu:info_results:"):
@@ -1716,12 +1858,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await show_toggle_menu(None, context, setting_key, label, query=query)
         return
 
+async def clear_state_pre_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text and update.message.text.startswith("/"):
+        context.user_data.pop("awaiting_results_date", None)
+        context.user_data.pop("menu_message_id", None)
+
 def main():
     state._init_db()
     
     application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     
     application.add_error_handler(error_handler)
+    
+    # Pre-handler in a separate group to clear custom date state when a command is executed
+    application.add_handler(MessageHandler(filters.COMMAND, clear_state_pre_handler), group=-1)
     
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("addteam", addteam_cmd))

@@ -17,14 +17,16 @@ A fully-featured Telegram bot that keeps you up-to-date with every match of the 
 
 | Feature | Details |
 |---|---|
+| 📱 Interactive Control Panel | Access a dashboard `/menu` with buttons to manage settings, teams, and schedules |
 | 🔔 Pre-match reminders | Get notified *N* minutes before your favourite team kicks off |
 | ⚽ Live goal alerts | Real-time goal notifications (polls every **10 seconds** during active matches) |
 | 🏁 Full-time results | Automatic result push for every World Cup match |
+| 📟 Monospace ASCII Cards | Matches, schedules, and live alerts rendered inside sleek, mobile-optimized ASCII cards |
 | 📋 Full fixture | Browse the complete tournament schedule, grouped by stage & group |
 | 📅 Today / Tomorrow | Quick view of the day's matches with live/upcoming/finished status |
 | 🔴 Live scores | See all currently in-progress matches with scores |
 | 📊 Results by date | Look up finished matches for today, yesterday, or any date |
-| 👕 Multiple favourites | Track as many teams as you want |
+| 👕 Multiple favourites | Track as many teams as you want (with checkboxes/checkmark lists) |
 | 🌍 Timezone-aware | All times shown in your configured local timezone |
 | ⚙️ Granular toggles | Independently enable/disable reminders, goal alerts, and result notifications |
 
@@ -86,20 +88,16 @@ You should see:
 
 1. Open Telegram and start a chat with your bot.
 2. Send `/start` — the bot will register your session.
-3. Add your favourite team(s) with `/addteam`, e.g.:
-   ```
-   /addteam Brazil
-   /addteam Germany
-   ```
-4. Optionally set your timezone so times are shown correctly:
-   ```
-   /settimezone Asia/Dhaka
-   ```
-5. That's it — you'll receive automatic reminders and notifications!
+3. Type `/menu` to open your interactive dashboard.
+4. Go to **My Teams** -> **Add Team** to search and choose your favorite teams.
+5. Go to **Settings & Preferences** -> **Set Timezone** to search and select your city timezone.
+6. That's it — you'll receive automatic reminders and notifications!
 
 ---
 
 ## 📖 Command Reference
+
+> 💡 **Recommended:** Just type `/menu` to access all configurations, matches, and status indicators using clean, interactive buttons rather than typing slash commands manually.
 
 ### ⚙️ Configuration
 
@@ -178,17 +176,18 @@ The bot uses **APScheduler** (background thread) alongside the async Telegram po
 | `remind_{match_id}` | One-shot (at kickoff − N min) | Sends pre-match reminder to user |
 | `startpoll_{match_id}` | One-shot (at kickoff) | Arms the result poller when match time arrives |
 | `poll_{match_id}` | Every 3 minutes | Polls match status until FINISHED; sends result |
-| `live_poller` | Every **10 seconds** | Detects score changes across all live matches; fires goal alerts |
+| `live_poller` | Every **10 seconds** | Detects score changes and transitions to finished status; sends goal alerts and final results |
 
-### Live Goal Detection
+### Live Goal & Match End Detection
 
 The `live_poller` job runs only while matches are active:
 
-1. Calls `get_live_matches()` — one API call that fetches all fixtures and filters locally.
-2. Compares each match's score against an in-memory cache (`_live_score_cache`).
-3. On a score change → calls `send_goal_alert()` → broadcasts to all users.
-4. When no live matches remain, the job **removes itself** to save API quota.
-5. It is automatically re-armed when the next match goes live.
+1. Calls `get_all_wc_matches(bypass_cache=True)` — a single API call that fetches all fixtures and processes them locally to save API quota.
+2. Compares each active match's score against an in-memory cache (`_live_score_cache`) to detect and broadcast goals in real-time.
+3. Identifies when matches transition from live to ended (when a cached match is no longer in the active matches list).
+4. For any transitioned match, if its status is finished (`FINISHED`, `AWARDED`, `CANCELLED`), it immediately dispatches the final results notification to users (respecting settings) and cleans up its associated `poll_{match_id}` and `startpoll_{match_id}` scheduler jobs.
+5. When no live matches remain, the job **removes itself** to save API quota.
+6. It is automatically re-armed when the next match goes live.
 
 ### API Rate Limiting
 
@@ -197,7 +196,8 @@ The free tier allows **10 requests per minute**. The bot manages this by:
 - Adding a 0.7 s delay between every API request.
 - Checking the `X-RequestsAvailable` response header.
 - Catching 429 responses and gracefully skipping that poll cycle.
-- The `live_poller` makes **1 call per 10 seconds** (6/min), leaving headroom for result pollers and user commands.
+- **In-Memory Caching**: Caches tournament match data in memory for 5 minutes (`get_all_wc_matches`) and resolves individual team schedules locally, avoiding redundant network queries and automatically falling back to cached schedules if the API is rate-limited.
+- The `live_poller` makes **1 call per 10 seconds** (6/min), bypassing the cache (via `bypass_cache=True`) to ensure real-time score delivery while leaving headroom for other pollers.
 
 ---
 

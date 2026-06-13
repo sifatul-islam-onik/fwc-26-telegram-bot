@@ -226,24 +226,46 @@ def _poll_live_goals(application):
     """Polls all currently live WC matches every 10 seconds and sends a goal
     alert to all users whenever the score changes for any match.
 
-    Uses a single API call (get_live_matches) to minimise API usage.
+    Also detects when live matches are finished and broadcasts the final results.
+
+    Uses a single API call (get_all_wc_matches) to minimise API usage.
     Stops itself automatically when no matches are live.
     """
     try:
-        live_matches = football_api.get_live_matches()
+        all_matches = football_api.get_all_wc_matches(bypass_cache=True)
     except football_api.RateLimitException as e:
         logger.warning(f"Live-goal poller rate-limited. Skipping this tick. (Wait {e.retry_after}s)")
         return
 
-    if not live_matches:
-        # No live matches — shut down the poller to save API quota
-        _stop_live_poller()
+    if not all_matches:
         return
 
+    LIVE_STATUSES = ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTY_SHOOTOUT")
+    FINISHED_STATUSES = ("FINISHED", "AWARDED", "CANCELLED", "POSTPONED")
+    now_utc = datetime.now(pytz.utc)
+
+    live_matches = []
+    finished_matches_lookup = {}
+    for m in all_matches:
+        status = m.get("status")
+        if status in LIVE_STATUSES:
+            live_matches.append(m)
+        elif status not in FINISHED_STATUSES:
+            utc_date_str = m.get("utcDate")
+            if utc_date_str:
+                match_dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+                elapsed = (now_utc - match_dt).total_seconds()
+                if 0 <= elapsed <= 130 * 60:
+                    live_matches.append(m)
+        else:
+            finished_matches_lookup[m.get("id")] = m
+
+    live_match_ids = set()
     for match in live_matches:
         match_id = match.get("id")
         if not match_id:
             continue
+        live_match_ids.add(match_id)
 
         new_home = match.get("score.fullTime.home")
         new_away = match.get("score.fullTime.away")
@@ -270,6 +292,33 @@ def _poll_live_goals(application):
             )
             _live_score_cache[match_id] = (new_home, new_away)
             _run_async(notifier.send_goal_alert(application, match, prev_home, prev_away))
+
+    # Detect finished matches (in _live_score_cache but not in live_matches)
+    for cached_id in list(_live_score_cache.keys()):
+        if cached_id not in live_match_ids:
+            finished_match = finished_matches_lookup.get(cached_id)
+            if finished_match:
+                status = finished_match.get("status")
+                if status in ("FINISHED", "AWARDED", "CANCELLED"):
+                    if not state.is_notified(cached_id, "result"):
+                        logger.info(f"Match {cached_id} finished. Sending result notification.")
+                        _run_async(notifier.send_result(application, finished_match))
+                        state.mark_notified(cached_id, "result")
+                        
+                        # Clean up jobs for this match
+                        poll_job_id = f"poll_{cached_id}"
+                        startpoll_job_id = f"startpoll_{cached_id}"
+                        if _scheduler.get_job(poll_job_id):
+                            _scheduler.remove_job(poll_job_id)
+                        if _scheduler.get_job(startpoll_job_id):
+                            _scheduler.remove_job(startpoll_job_id)
+            
+            # Remove from cache as it's no longer live
+            _live_score_cache.pop(cached_id, None)
+
+    if not live_matches:
+        # No live matches — shut down the poller to save API quota
+        _stop_live_poller()
 
 def _sync_schedule_background(application):
     try:
