@@ -347,7 +347,7 @@ def start_scheduler(application):
         
     _scheduler.add_job(
         func=_sync_schedule_background,
-        trigger=IntervalTrigger(hours=2),
+        trigger=IntervalTrigger(minutes=30),
         args=[application],
         id="sync_schedule",
         replace_existing=True
@@ -355,7 +355,7 @@ def start_scheduler(application):
     
     _scheduler.add_job(
         func=_sync_schedule_background,
-        trigger=DateTrigger(run_date=datetime.now() + timedelta(seconds=5)),
+        trigger=DateTrigger(run_date=datetime.now(pytz.utc) + timedelta(seconds=5)),
         args=[application],
         id="sync_schedule_startup",
         replace_existing=True

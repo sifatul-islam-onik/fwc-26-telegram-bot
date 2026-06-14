@@ -411,7 +411,7 @@ async def _get_results_text(chat_id: int, target_date_arg: str) -> str:
         
     finished_matches.sort(key=lambda x: x.get("utcDate", ""))
     
-    msg = f"🏆 *Match Results — {_escape(target_date_str)}*\n\n"
+    msg = f"🏆 *Match Results \\({_escape(tz_str)}\\) — {_escape(target_date_str)}*\n\n"
     for m in finished_matches:
         home = m.get("homeTeam.name", "TBD")
         away = m.get("awayTeam.name", "TBD")

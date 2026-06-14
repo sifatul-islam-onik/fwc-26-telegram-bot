@@ -30,7 +30,7 @@ def _safe_get(url: str, params: dict = None) -> dict | None:
     time.sleep(0.7)
     
     try:
-        response = session.get(url, params=params)
+        response = session.get(url, params=params, timeout=5)
         
         # Update remaining requests if header exists
         rem = response.headers.get("X-RequestsAvailable")
